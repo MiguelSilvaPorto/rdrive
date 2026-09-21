@@ -40,7 +40,7 @@ Expor a nuvem como `/dev/nbdX` formatável via `rclone serve nbd`. Rejeitado por
 Alternativa mais leve ao NBD para "parecer um disco": adicionar a montagem aos bookmarks do Dolphin/Nautilus automaticamente ao montar. Não aparece em "Dispositivos" (isso exige udisks2/bloco real), mas fica fixo e acessível.
 
 ### 6. Estender o streaming/otimização de montagem a mais categorias
-Hoje só a categoria "Meu Drive" lê da pasta montada quando disponível. "Recentes"/"Lixeira" continuam a usar `rclone backend query` (rápido mas não fazem streaming progressivo real — emitem tudo de uma vez no fim). Podia-se aplicar a mesma otimização de leitura local onde fizer sentido.
+"Recentes"/"Lixeira" não podem ler da pasta montada (não fazem parte da árvore FUSE normal), por isso continuam sempre a pedir à API. Mitigado parcialmente: timeout de 25s com erro claro + cache "stale-while-revalidate" no frontend (mostra o resultado anterior na hora, atualiza por trás). Continuam sem streaming progressivo real (a API do Drive devolve tudo numa resposta só para `backend query`).
 
 ### 7. Corrigir possível imprecisão no "Restaurar" (untrash) de itens aninhados
 `untrash_cloud_paths` (em `explorer.rs`) recebe nomes/paths dos itens da lixeira, mas a consulta à API devolve itens de qualquer profundidade da árvore sem um "path" fiável relativo à raiz — `rclone backend untrash remote:path` pode não localizar corretamente itens que não estejam na raiz. Vale a pena testar restaurar um ficheiro trashed que estava numa subpasta e confirmar/corrigir.
