@@ -149,6 +149,10 @@ pub fn list_remotes(state: State<'_, AppState>) -> Result<Vec<RemoteDrive>, Stri
 pub async fn mount_remote(
     remote: String,
     custom_mount_point: Option<String>,
+    vfs_cache_mode: Option<String>,
+    read_only: Option<bool>,
+    vfs_cache_max_size_gb: Option<f64>,
+    cache_dir: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let mount_dir = match custom_mount_point {
@@ -181,13 +185,14 @@ pub async fn mount_remote(
 
     let remote_arg = format!("{}:", remote);
     let mount_str = mount_dir.to_string_lossy().to_string();
+    let cache_mode = vfs_cache_mode.unwrap_or_else(|| "full".to_string());
 
-    let child = Command::new("rclone")
-        .arg("mount")
+    let mut cmd = Command::new("rclone");
+    cmd.arg("mount")
         .arg(&remote_arg)
         .arg(&mount_str)
         .arg("--vfs-cache-mode")
-        .arg("full")
+        .arg(&cache_mode)
         .arg("--vfs-cache-max-age")
         .arg("24h")
         .arg("--buffer-size")
@@ -196,6 +201,30 @@ pub async fn mount_remote(
         .arg("32M")
         .arg("--vfs-read-chunk-size-limit")
         .arg("512M")
+        .arg("--dir-cache-time")
+        .arg("1h")
+        .arg("--attr-timeout")
+        .arg("1h")
+        .arg("--vfs-cache-poll-interval")
+        .arg("30s");
+
+    if read_only.unwrap_or(false) {
+        cmd.arg("--read-only");
+    }
+
+    if let Some(gb) = vfs_cache_max_size_gb {
+        if gb > 0.0 {
+            cmd.arg("--vfs-cache-max-size").arg(format!("{gb}G"));
+        }
+    }
+
+    if let Some(dir) = cache_dir.filter(|d| !d.trim().is_empty()) {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Não foi possível criar a pasta de cache '{dir}': {e}"))?;
+        cmd.arg("--cache-dir").arg(&dir);
+    }
+
+    let child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -356,6 +385,53 @@ pub fn delete_remote(remote: String, state: State<'_, AppState>) -> Result<Strin
     }
 
     Ok(format!("Remote '{remote}' removido."))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteAbout {
+    pub total: Option<i64>,
+    pub used: Option<i64>,
+    pub free: Option<i64>,
+}
+
+/// Fetches quota / storage info for a remote using `rclone about <remote>: --json`
+#[tauri::command]
+pub async fn get_remote_about(remote: String) -> Result<RemoteAbout, String> {
+    let remote_arg = format!("{}:", remote);
+    let output = tokio::process::Command::new("rclone")
+        .arg("about")
+        .arg(&remote_arg)
+        .arg("--json")
+        .output()
+        .await
+        .map_err(|e| format!("Falha ao executar rclone about: {e}"))?;
+
+    if !output.status.success() {
+        return Ok(RemoteAbout {
+            total: None,
+            used: None,
+            free: None,
+        });
+    }
+
+    #[derive(Deserialize)]
+    struct RawAbout {
+        total: Option<i64>,
+        used: Option<i64>,
+        free: Option<i64>,
+    }
+
+    let raw: RawAbout = serde_json::from_slice(&output.stdout).unwrap_or(RawAbout {
+        total: None,
+        used: None,
+        free: None,
+    });
+
+    Ok(RemoteAbout {
+        total: raw.total,
+        used: raw.used,
+        free: raw.free,
+    })
 }
 
 /// Downloads and runs the official rclone install script (https://rclone.org/install.sh),

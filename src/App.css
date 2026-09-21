@@ -2,22 +2,35 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
-  font-family: "Google Sans", "Segoe UI", Roboto, -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Google Sans", Helvetica, Arial, sans-serif;
   user-select: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 body {
   margin: 0;
   padding: 0;
-  background-color: #f8f9fa;
-  color: #202124;
-  overflow-x: hidden;
+  background-color: #0b0f17;
+  color: #f1f5f9;
+  overflow: hidden;
   transition: background-color 0.25s ease, color 0.25s ease;
 }
 
-.dark body {
-  background-color: #202124;
-  color: #e8eaed;
+/* Scrollbar customization */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.2);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.4);
 }
 
 @keyframes fadeIn {
@@ -32,7 +45,7 @@ body {
 @keyframes scaleIn {
   from {
     opacity: 0;
-    transform: scale(0.94) translateY(6px);
+    transform: scale(0.96) translateY(4px);
   }
   to {
     opacity: 1;
@@ -43,7 +56,7 @@ body {
 @keyframes slideUp {
   from {
     opacity: 0;
-    transform: translateY(10px);
+    transform: translateY(8px);
   }
   to {
     opacity: 1;
@@ -61,34 +74,40 @@ body {
 }
 
 .animate-fadeIn {
-  animation: fadeIn 0.2s ease-out;
+  animation: fadeIn 0.18s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 .animate-scaleIn {
-  animation: scaleIn 0.18s cubic-bezier(0.2, 0, 0.2, 1);
+  animation: scaleIn 0.2s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 .animate-slideUp {
-  animation: slideUp 0.35s cubic-bezier(0.2, 0, 0.2, 1) both;
+  animation: slideUp 0.25s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 .skeleton {
-  background: linear-gradient(90deg, #eceff1 25%, #f5f6f7 37%, #eceff1 63%);
+  background: linear-gradient(90deg, rgba(255,255,255,0.03) 25%, rgba(255,255,255,0.08) 37%, rgba(255,255,255,0.03) 63%);
   background-size: 400px 100%;
   animation: shimmer 1.4s ease-in-out infinite;
 }
 
+.rdrive-card,
 .gdrive-card {
-  transition: box-shadow 0.18s ease, transform 0.18s ease, border-color 0.18s ease;
+  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.2s ease;
 }
 
+.rdrive-card:hover,
 .gdrive-card:hover {
-  box-shadow: 0 1px 2px 0 rgba(60, 64, 67, 0.3), 0 2px 6px 2px rgba(60, 64, 67, 0.15);
   transform: translateY(-2px);
 }
 
+.glass-panel {
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
 .gdrive-btn {
-  transition: background-color 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease;
+  transition: background-color 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease, color 0.15s ease;
 }
 
 .gdrive-btn:active {
@@ -126,14 +145,6 @@ body {
 
 .theme-card-preview {
   transition: transform 0.22s cubic-bezier(0.2, 0, 0.2, 1), filter 0.22s ease;
-}
-
-.theme-card:hover .theme-card-dot {
-  transform: translateY(-1px);
-}
-
-.theme-card-dot {
-  transition: transform 0.2s ease, opacity 0.2s ease;
 }
 
 .theme-check {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
@@ -25,10 +25,59 @@ import {
   Minus,
   Square as SquareIcon,
   Download,
+  SlidersHorizontal,
+  FolderTree,
+  File as FileIcon,
+  Folder as FolderIcon,
+  ChevronRight,
+  Copy,
+  Move,
+  FolderPlus,
+  CheckSquare,
+  Square as SquareEmptyIcon,
 } from "lucide-react";
 import "./App.css";
 
 const appWindow = getCurrentWindow();
+
+interface MountSettings {
+  customMountPoint: string;
+  vfsCacheMode: "full" | "writes" | "minimal" | "off";
+  readOnly: boolean;
+  cacheMaxSizeGb: number;
+  cacheDir: string;
+  autoRemount: boolean;
+}
+
+const DEFAULT_MOUNT_SETTINGS: MountSettings = {
+  customMountPoint: "",
+  vfsCacheMode: "full",
+  readOnly: false,
+  cacheMaxSizeGb: 10,
+  cacheDir: "",
+  autoRemount: false,
+};
+
+const CACHE_MODES: { id: MountSettings["vfsCacheMode"]; label: string; hint: string }[] = [
+  { id: "off", label: "Desligado", hint: "Sem cache local, tudo passa pela rede a cada acesso" },
+  { id: "minimal", label: "Mínimo", hint: "Cache apenas de metadados" },
+  { id: "writes", label: "Escritas", hint: "Cacheia arquivos sendo escritos" },
+  { id: "full", label: "Completo (disco)", hint: "Comportamento mais próximo de um disco local" },
+];
+
+const loadMountSettings = (remote: string): MountSettings => {
+  try {
+    const raw = localStorage.getItem(`rdrive-mount-${remote}`);
+    if (raw) return { ...DEFAULT_MOUNT_SETTINGS, ...JSON.parse(raw) };
+  } catch {}
+  return { ...DEFAULT_MOUNT_SETTINGS };
+};
+
+const saveMountSettings = (remote: string, settings: MountSettings) => {
+  try {
+    localStorage.setItem(`rdrive-mount-${remote}`, JSON.stringify(settings));
+  } catch {}
+};
 
 type ThemeId = "light" | "dark" | "system";
 
@@ -58,6 +107,21 @@ interface CloudProvider {
   label: string;
 }
 
+interface CloudEntry {
+  Name: string;
+  Size: number;
+  IsDir: boolean;
+  ModTime: string;
+}
+
+const formatBytes = (bytes: number) => {
+  if (bytes < 0) return "-";
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+};
+
 export default function App() {
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [remotes, setRemotes] = useState<RemoteDrive[]>([]);
@@ -73,6 +137,18 @@ export default function App() {
   const [installingRclone, setInstallingRclone] = useState(false);
 
   const [showSettings, setShowSettings] = useState(false);
+  const [mountSettingsFor, setMountSettingsFor] = useState<string | null>(null);
+  const [mountSettingsDraft, setMountSettingsDraft] = useState<MountSettings>(DEFAULT_MOUNT_SETTINGS);
+
+  const [explorerFor, setExplorerFor] = useState<string | null>(null);
+  const [explorerPath, setExplorerPath] = useState<string>("");
+  const [explorerEntries, setExplorerEntries] = useState<CloudEntry[]>([]);
+  const [explorerLoading, setExplorerLoading] = useState(false);
+  const [explorerSelected, setExplorerSelected] = useState<Set<string>>(new Set());
+  const [explorerBusy, setExplorerBusy] = useState(false);
+  const [explorerTransferMode, setExplorerTransferMode] = useState<"copy" | "move" | null>(null);
+  const [explorerDestInput, setExplorerDestInput] = useState("");
+  const [explorerNewFolder, setExplorerNewFolder] = useState<string | null>(null);
   const [theme, setTheme] = useState<ThemeId>(() => (localStorage.getItem("rdrive-theme") as ThemeId) || "light");
 
   useEffect(() => {
@@ -92,6 +168,8 @@ export default function App() {
     }
   }, [theme]);
 
+  const autoRemountInFlight = useRef<Set<string>>(new Set());
+
   const fetchStatusAndRemotes = async () => {
     setLoading(true);
     try {
@@ -101,6 +179,17 @@ export default function App() {
       if (sysStatus.rclone_installed) {
         const remoteList = await invoke<RemoteDrive[]>("list_remotes");
         setRemotes(remoteList);
+
+        for (const remote of remoteList) {
+          if (remote.is_mounted || autoRemountInFlight.current.has(remote.name)) continue;
+          const settings = loadMountSettings(remote.name);
+          if (!settings.autoRemount) continue;
+
+          autoRemountInFlight.current.add(remote.name);
+          handleMount(remote.name, { silent: true }).finally(() => {
+            autoRemountInFlight.current.delete(remote.name);
+          });
+        }
       }
     } catch (err: any) {
       console.error(err);
@@ -174,17 +263,152 @@ export default function App() {
     }
   };
 
-  const handleMount = async (remoteName: string) => {
-    setActionLoading(remoteName);
-    setMessage(null);
+  const handleMount = async (remoteName: string, opts?: { silent?: boolean }) => {
+    const silent = opts?.silent ?? false;
+    if (!silent) {
+      setActionLoading(remoteName);
+      setMessage(null);
+    }
+    const settings = loadMountSettings(remoteName);
     try {
-      const res = await invoke<string>("mount_remote", { remote: remoteName });
+      const res = await invoke<string>("mount_remote", {
+        remote: remoteName,
+        customMountPoint: settings.customMountPoint.trim() || null,
+        vfsCacheMode: settings.vfsCacheMode,
+        readOnly: settings.readOnly,
+        vfsCacheMaxSizeGb: settings.vfsCacheMode === "off" ? null : settings.cacheMaxSizeGb,
+        cacheDir: settings.cacheDir.trim() || null,
+      });
+      if (silent) {
+        const remoteList = await invoke<RemoteDrive[]>("list_remotes");
+        setRemotes(remoteList);
+      } else {
+        setMessage({ type: "success", text: res });
+        await fetchStatusAndRemotes();
+      }
+    } catch (err: any) {
+      setMessage({ type: "error", text: silent ? `Auto-remontagem falhou para '${remoteName}': ${err}` : String(err) });
+    } finally {
+      if (!silent) setActionLoading(null);
+    }
+  };
+
+  const openMountSettings = (remoteName: string) => {
+    setMountSettingsDraft(loadMountSettings(remoteName));
+    setMountSettingsFor(remoteName);
+  };
+
+  const saveMountSettingsAndClose = () => {
+    if (mountSettingsFor) saveMountSettings(mountSettingsFor, mountSettingsDraft);
+    setMountSettingsFor(null);
+  };
+
+  const explorerJoin = (base: string, name: string) => (base ? `${base}/${name}` : name);
+  const explorerBreadcrumbs = () => (explorerPath ? explorerPath.split("/").filter(Boolean) : []);
+
+  const loadExplorer = async (remote: string, path: string) => {
+    setExplorerLoading(true);
+    setExplorerSelected(new Set());
+    try {
+      const entries = await invoke<CloudEntry[]>("list_cloud_files", { remote, path });
+      setExplorerEntries(entries);
+    } catch (err: any) {
+      setMessage({ type: "error", text: String(err) });
+      setExplorerEntries([]);
+    } finally {
+      setExplorerLoading(false);
+    }
+  };
+
+  const openExplorer = (remote: string) => {
+    setExplorerFor(remote);
+    setExplorerPath("");
+    setExplorerTransferMode(null);
+    setExplorerNewFolder(null);
+    loadExplorer(remote, "");
+  };
+
+  const explorerNavigate = (path: string) => {
+    setExplorerPath(path);
+    if (explorerFor) loadExplorer(explorerFor, path);
+  };
+
+  const toggleExplorerSelect = (name: string) => {
+    setExplorerSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+
+  const toggleExplorerSelectAll = () => {
+    setExplorerSelected((prev) =>
+      prev.size === explorerEntries.length ? new Set() : new Set(explorerEntries.map((e) => e.Name))
+    );
+  };
+
+  const handleExplorerDelete = async () => {
+    if (!explorerFor || explorerSelected.size === 0) return;
+    const items = explorerEntries.filter((e) => explorerSelected.has(e.Name));
+    if (!confirm(`Remover ${items.length} item(ns) da nuvem? Esta ação não pode ser desfeita.`)) return;
+
+    setExplorerBusy(true);
+    try {
+      const res = await invoke<string>("delete_cloud_paths", {
+        remote: explorerFor,
+        paths: items.map((i) => explorerJoin(explorerPath, i.Name)),
+        isDir: items.map((i) => i.IsDir),
+      });
       setMessage({ type: "success", text: res });
-      await fetchStatusAndRemotes();
+      await loadExplorer(explorerFor, explorerPath);
     } catch (err: any) {
       setMessage({ type: "error", text: String(err) });
     } finally {
-      setActionLoading(null);
+      setExplorerBusy(false);
+    }
+  };
+
+  const handleExplorerTransfer = async () => {
+    if (!explorerFor || explorerSelected.size === 0 || !explorerTransferMode || !explorerDestInput.trim()) return;
+    const items = explorerEntries.filter((e) => explorerSelected.has(e.Name));
+    setExplorerBusy(true);
+    try {
+      for (const item of items) {
+        const dest = explorerJoin(explorerDestInput.trim(), item.Name);
+        await invoke<string>("transfer_cloud_path", {
+          remote: explorerFor,
+          source: explorerJoin(explorerPath, item.Name),
+          destination: dest,
+          isDir: item.IsDir,
+          moveInsteadOfCopy: explorerTransferMode === "move",
+        });
+      }
+      setMessage({ type: "success", text: `${items.length} item(ns) ${explorerTransferMode === "move" ? "movido(s)" : "copiado(s)"}.` });
+      setExplorerTransferMode(null);
+      setExplorerDestInput("");
+      await loadExplorer(explorerFor, explorerPath);
+    } catch (err: any) {
+      setMessage({ type: "error", text: String(err) });
+    } finally {
+      setExplorerBusy(false);
+    }
+  };
+
+  const handleExplorerCreateFolder = async () => {
+    if (!explorerFor || !explorerNewFolder?.trim()) return;
+    setExplorerBusy(true);
+    try {
+      await invoke<string>("create_cloud_folder", {
+        remote: explorerFor,
+        path: explorerJoin(explorerPath, explorerNewFolder.trim()),
+      });
+      setExplorerNewFolder(null);
+      await loadExplorer(explorerFor, explorerPath);
+    } catch (err: any) {
+      setMessage({ type: "error", text: String(err) });
+    } finally {
+      setExplorerBusy(false);
     }
   };
 
@@ -365,7 +589,228 @@ export default function App() {
         </aside>
 
         {/* Main content */}
-        <main className="flex-1 overflow-y-auto px-8 py-6">
+        <main className={`flex-1 overflow-y-auto ${explorerFor ? "flex flex-col" : "px-8 py-6"}`}>
+          {explorerFor ? (
+          <div className="flex-1 flex flex-col min-h-0">
+            <div className="flex items-center justify-between px-6 py-3 border-b border-[#e8eaed] dark:border-white/10 shrink-0">
+              <div className="flex items-center space-x-2 min-w-0">
+                <button
+                  onClick={() => setExplorerFor(null)}
+                  className="gdrive-btn p-1.5 -ml-1.5 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                  title="Voltar para os drives"
+                >
+                  <ChevronRight className="w-5 h-5 rotate-180" />
+                </button>
+                <FolderTree className="w-5 h-5 text-[#1a73e8] dark:text-[#8ab4f8] shrink-0" />
+                <h1 className="text-[18px] font-medium text-[#202124] dark:text-[#e8eaed] truncate">
+                  Explorador · {explorerFor}
+                </h1>
+              </div>
+            </div>
+
+            {/* Breadcrumbs */}
+            <div className="flex items-center flex-wrap gap-1 px-6 py-2.5 border-b border-[#e8eaed] dark:border-white/10 text-xs shrink-0">
+              <button
+                onClick={() => explorerNavigate("")}
+                className="gdrive-btn px-2 py-1 rounded-md text-[#1a73e8] dark:text-[#8ab4f8] hover:bg-[#e8f0fe] dark:hover:bg-white/10 cursor-pointer font-medium"
+              >
+                {explorerFor}
+              </button>
+              {explorerBreadcrumbs().map((segment, idx) => {
+                const path = explorerBreadcrumbs().slice(0, idx + 1).join("/");
+                return (
+                  <div key={path} className="flex items-center gap-1">
+                    <ChevronRight className="w-3.5 h-3.5 text-[#9aa0a6]" />
+                    <button
+                      onClick={() => explorerNavigate(path)}
+                      className="gdrive-btn px-2 py-1 rounded-md text-[#3c4043] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 cursor-pointer"
+                    >
+                      {segment}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Toolbar */}
+            <div className="flex items-center flex-wrap gap-2 px-6 py-2.5 border-b border-[#e8eaed] dark:border-white/10 shrink-0">
+              <button
+                onClick={toggleExplorerSelectAll}
+                className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#3c4043] dark:text-[#e8eaed] bg-[#f1f3f4] dark:bg-white/10 hover:bg-[#e8eaed] dark:hover:bg-white/20 rounded-full transition cursor-pointer"
+              >
+                {explorerSelected.size > 0 && explorerSelected.size === explorerEntries.length ? (
+                  <CheckSquare className="w-3.5 h-3.5" />
+                ) : (
+                  <SquareEmptyIcon className="w-3.5 h-3.5" />
+                )}
+                <span>Selecionar tudo</span>
+              </button>
+              <button
+                onClick={() => setExplorerNewFolder("")}
+                className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#3c4043] dark:text-[#e8eaed] bg-[#f1f3f4] dark:bg-white/10 hover:bg-[#e8eaed] dark:hover:bg-white/20 rounded-full transition cursor-pointer"
+              >
+                <FolderPlus className="w-3.5 h-3.5" />
+                <span>Nova pasta</span>
+              </button>
+
+              <span className="flex-1" />
+
+              {explorerSelected.size > 0 && (
+                <>
+                  <span className="text-xs text-[#9aa0a6]">{explorerSelected.size} selecionado(s)</span>
+                  <button
+                    onClick={() => {
+                      setExplorerTransferMode("copy");
+                      setExplorerDestInput(explorerPath);
+                    }}
+                    disabled={explorerBusy}
+                    className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#1a73e8] bg-[#e8f0fe] hover:bg-[#d2e3fc] rounded-full transition cursor-pointer disabled:opacity-50"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>Copiar</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setExplorerTransferMode("move");
+                      setExplorerDestInput(explorerPath);
+                    }}
+                    disabled={explorerBusy}
+                    className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#1a73e8] bg-[#e8f0fe] hover:bg-[#d2e3fc] rounded-full transition cursor-pointer disabled:opacity-50"
+                  >
+                    <Move className="w-3.5 h-3.5" />
+                    <span>Mover</span>
+                  </button>
+                  <button
+                    onClick={handleExplorerDelete}
+                    disabled={explorerBusy}
+                    className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#d93025] bg-[#fce8e6] hover:bg-[#fad2cf] rounded-full transition cursor-pointer disabled:opacity-50"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Deletar</span>
+                  </button>
+                </>
+              )}
+            </div>
+
+            {/* New folder inline input */}
+            {explorerNewFolder !== null && (
+              <div className="animate-fadeIn flex items-center gap-2 px-6 py-2.5 border-b border-[#e8eaed] dark:border-white/10 bg-[#f8f9fa] dark:bg-[#202124] shrink-0">
+                <input
+                  autoFocus
+                  type="text"
+                  value={explorerNewFolder}
+                  onChange={(e) => setExplorerNewFolder(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleExplorerCreateFolder()}
+                  placeholder="Nome da nova pasta"
+                  className="flex-1 px-3 py-1.5 text-sm border border-[#dadce0] dark:border-white/15 dark:bg-transparent dark:text-[#e8eaed] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40"
+                />
+                <button
+                  onClick={handleExplorerCreateFolder}
+                  disabled={!explorerNewFolder.trim() || explorerBusy}
+                  className="gdrive-btn px-4 py-1.5 text-xs font-medium text-white bg-[#1a73e8] hover:bg-[#1765cc] rounded-full transition cursor-pointer disabled:opacity-50"
+                >
+                  Criar
+                </button>
+                <button
+                  onClick={() => setExplorerNewFolder(null)}
+                  className="gdrive-btn p-1.5 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+
+            {/* Copy/Move destination input */}
+            {explorerTransferMode && (
+              <div className="animate-fadeIn flex items-center gap-2 px-6 py-2.5 border-b border-[#e8eaed] dark:border-white/10 bg-[#f8f9fa] dark:bg-[#202124] shrink-0">
+                <span className="text-xs text-[#5f6368] dark:text-[#9aa0a6] shrink-0">
+                  {explorerTransferMode === "copy" ? "Copiar para:" : "Mover para:"}
+                </span>
+                <input
+                  autoFocus
+                  type="text"
+                  value={explorerDestInput}
+                  onChange={(e) => setExplorerDestInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleExplorerTransfer()}
+                  placeholder="caminho/na/nuvem"
+                  className="flex-1 px-3 py-1.5 text-sm border border-[#dadce0] dark:border-white/15 dark:bg-transparent dark:text-[#e8eaed] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40"
+                />
+                <button
+                  onClick={handleExplorerTransfer}
+                  disabled={!explorerDestInput.trim() || explorerBusy}
+                  className="gdrive-btn px-4 py-1.5 text-xs font-medium text-white bg-[#1a73e8] hover:bg-[#1765cc] rounded-full transition cursor-pointer disabled:opacity-50"
+                >
+                  Confirmar
+                </button>
+                <button
+                  onClick={() => setExplorerTransferMode(null)}
+                  className="gdrive-btn p-1.5 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+
+            {/* File list */}
+            <div className="flex-1 overflow-y-auto">
+              {explorerLoading ? (
+                <div className="p-6 space-y-2">
+                  {[1, 2, 3, 4].map((i) => (
+                    <div key={i} className="skeleton h-10 rounded-lg" />
+                  ))}
+                </div>
+              ) : explorerEntries.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full text-center px-6">
+                  <FolderIcon className="w-10 h-10 text-[#dadce0] mb-2" />
+                  <p className="text-sm text-[#9aa0a6]">Esta pasta está vazia.</p>
+                </div>
+              ) : (
+                <table className="w-full text-sm">
+                  <tbody>
+                    {explorerEntries.map((entry) => {
+                      const selected = explorerSelected.has(entry.Name);
+                      return (
+                        <tr
+                          key={entry.Name}
+                          onClick={() => toggleExplorerSelect(entry.Name)}
+                          onDoubleClick={() => entry.IsDir && explorerNavigate(explorerJoin(explorerPath, entry.Name))}
+                          className={`cursor-pointer border-b border-[#f1f3f4] dark:border-white/5 hover:bg-[#f8f9fa] dark:hover:bg-white/5 transition ${
+                            selected ? "bg-[#e8f0fe] dark:bg-[#3c4142]" : ""
+                          }`}
+                        >
+                          <td className="pl-6 py-2.5 w-8">
+                            {selected ? (
+                              <CheckSquare className="w-4 h-4 text-[#1a73e8] dark:text-[#8ab4f8]" />
+                            ) : (
+                              <SquareEmptyIcon className="w-4 h-4 text-[#dadce0]" />
+                            )}
+                          </td>
+                          <td className="py-2.5 w-8">
+                            {entry.IsDir ? (
+                              <FolderIcon className="w-4 h-4 text-[#1a73e8] dark:text-[#8ab4f8]" />
+                            ) : (
+                              <FileIcon className="w-4 h-4 text-[#9aa0a6]" />
+                            )}
+                          </td>
+                          <td className="py-2.5 pr-3 text-[#202124] dark:text-[#e8eaed] truncate max-w-[1px] w-full">
+                            {entry.Name}
+                          </td>
+                          <td className="py-2.5 pr-3 text-[#9aa0a6] whitespace-nowrap text-xs">
+                            {entry.IsDir ? "—" : formatBytes(entry.Size)}
+                          </td>
+                          <td className="py-2.5 pr-6 text-[#9aa0a6] whitespace-nowrap text-xs">
+                            {entry.ModTime ? new Date(entry.ModTime).toLocaleDateString() : ""}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+          ) : (
+          <>
           {status && (!status.rclone_installed || !status.fuse_installed) && (
             <div className="animate-slideUp mb-5 p-4 rounded-xl bg-[#fef7e0] border border-[#f9ab00]/40 flex items-start space-x-3 text-[#7d5900]">
               <AlertTriangle className="w-5 h-5 text-[#f9ab00] shrink-0 mt-0.5" />
@@ -476,16 +921,32 @@ export default function App() {
                       </div>
                     </div>
 
-                    {!remote.is_mounted && (
+                    <div className="flex items-center space-x-0.5">
                       <button
-                        onClick={() => handleDelete(remote.name)}
-                        disabled={isAction}
-                        className="gdrive-btn p-1.5 text-[#9aa0a6] hover:text-[#d93025] hover:bg-[#fce8e6] rounded-full transition cursor-pointer disabled:opacity-40"
-                        title="Remover nuvem"
+                        onClick={() => openExplorer(remote.name)}
+                        className="gdrive-btn p-1.5 text-[#9aa0a6] hover:text-[#1a73e8] hover:bg-[#e8f0fe] rounded-full transition cursor-pointer"
+                        title="Explorador de arquivos na nuvem"
                       >
-                        <Trash2 className="w-4 h-4" />
+                        <FolderTree className="w-4 h-4" />
                       </button>
-                    )}
+                      <button
+                        onClick={() => openMountSettings(remote.name)}
+                        className="gdrive-btn p-1.5 text-[#9aa0a6] hover:text-[#1a73e8] hover:bg-[#e8f0fe] rounded-full transition cursor-pointer"
+                        title="Configurações de montagem"
+                      >
+                        <SlidersHorizontal className="w-4 h-4" />
+                      </button>
+                      {!remote.is_mounted && (
+                        <button
+                          onClick={() => handleDelete(remote.name)}
+                          disabled={isAction}
+                          className="gdrive-btn p-1.5 text-[#9aa0a6] hover:text-[#d93025] hover:bg-[#fce8e6] rounded-full transition cursor-pointer disabled:opacity-40"
+                          title="Remover nuvem"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
                   </div>
 
                   {remote.is_mounted ? (
@@ -541,6 +1002,8 @@ export default function App() {
               );
             })}
           </div>
+          </>
+          )}
         </main>
       </div>
 
@@ -640,6 +1103,146 @@ export default function App() {
               >
                 {authorizing && <Loader2 className="w-4 h-4 animate-spin" />}
                 <span>{authorizing ? "Autorizando" : "Autorizar no navegador"}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Per-remote Mount Settings Modal */}
+      {mountSettingsFor && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/40 animate-fadeIn" onClick={() => setMountSettingsFor(null)} />
+          <div className="relative animate-scaleIn bg-white dark:bg-[#2d2e30] rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+            <div className="flex items-center justify-between px-6 pt-5 pb-4 border-b border-[#e8eaed] dark:border-white/10">
+              <h2 className="text-lg font-medium text-[#202124] dark:text-[#e8eaed]">
+                Montagem de <span className="text-[#1a73e8] dark:text-[#8ab4f8]">{mountSettingsFor}</span>
+              </h2>
+              <button
+                onClick={() => setMountSettingsFor(null)}
+                className="gdrive-btn p-1.5 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="px-6 py-5 space-y-5">
+              <div>
+                <label className="block text-xs font-medium text-[#5f6368] dark:text-[#9aa0a6] mb-1.5">
+                  Ponto de montagem (opcional)
+                </label>
+                <input
+                  type="text"
+                  value={mountSettingsDraft.customMountPoint}
+                  onChange={(e) =>
+                    setMountSettingsDraft((s) => ({ ...s, customMountPoint: e.target.value }))
+                  }
+                  placeholder={`~/Rdrive/${mountSettingsFor}`}
+                  className="w-full px-3.5 py-2.5 text-sm border border-[#dadce0] dark:border-white/15 dark:bg-transparent dark:text-[#e8eaed] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40 focus:border-[#1a73e8] transition"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-[#5f6368] dark:text-[#9aa0a6] mb-1.5">
+                  Modo de cache (VFS)
+                </label>
+                <div className="grid grid-cols-2 gap-2">
+                  {CACHE_MODES.map((m) => (
+                    <button
+                      key={m.id}
+                      onClick={() => setMountSettingsDraft((s) => ({ ...s, vfsCacheMode: m.id }))}
+                      title={m.hint}
+                      className={`gdrive-btn px-3 py-2.5 rounded-xl text-xs font-medium border transition cursor-pointer text-left ${
+                        mountSettingsDraft.vfsCacheMode === m.id
+                          ? "border-[#1a73e8] bg-[#e8f0fe] text-[#1a73e8] dark:bg-[#3c4142] dark:text-[#8ab4f8] dark:border-[#8ab4f8]"
+                          : "border-[#e8eaed] dark:border-white/10 text-[#3c4043] dark:text-[#e8eaed] hover:bg-[#f8f9fa] dark:hover:bg-white/5"
+                      }`}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-[#9aa0a6] mt-1.5">
+                  {CACHE_MODES.find((m) => m.id === mountSettingsDraft.vfsCacheMode)?.hint}
+                </p>
+              </div>
+
+              {mountSettingsDraft.vfsCacheMode !== "off" && (
+                <div className="animate-fadeIn space-y-3 p-3.5 rounded-xl bg-[#f8f9fa] dark:bg-[#202124]">
+                  <div>
+                    <label className="flex items-center justify-between text-xs font-medium text-[#5f6368] dark:text-[#9aa0a6] mb-1.5">
+                      <span>Tamanho máximo do cache</span>
+                      <span className="text-[#1a73e8] dark:text-[#8ab4f8] font-semibold">
+                        {mountSettingsDraft.cacheMaxSizeGb} GB
+                      </span>
+                    </label>
+                    <input
+                      type="range"
+                      min={1}
+                      max={200}
+                      step={1}
+                      value={mountSettingsDraft.cacheMaxSizeGb}
+                      onChange={(e) =>
+                        setMountSettingsDraft((s) => ({ ...s, cacheMaxSizeGb: Number(e.target.value) }))
+                      }
+                      className="w-full accent-[#1a73e8] cursor-pointer"
+                    />
+                    <p className="text-[11px] text-[#9aa0a6] mt-1">
+                      Quando atingir o limite, os arquivos acessados há mais tempo são removidos do cache
+                      automaticamente (nunca da nuvem) para abrir espaço.
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-[#5f6368] dark:text-[#9aa0a6] mb-1.5">
+                      Pasta do cache (opcional)
+                    </label>
+                    <input
+                      type="text"
+                      value={mountSettingsDraft.cacheDir}
+                      onChange={(e) => setMountSettingsDraft((s) => ({ ...s, cacheDir: e.target.value }))}
+                      placeholder="ex: /mnt/hd-externo/rdrive-cache"
+                      className="w-full px-3.5 py-2.5 text-sm border border-[#dadce0] dark:border-white/15 dark:bg-transparent dark:text-[#e8eaed] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40 focus:border-[#1a73e8] transition"
+                    />
+                  </div>
+                </div>
+              )}
+
+              <label className="flex items-center justify-between cursor-pointer">
+                <span className="text-sm text-[#3c4043] dark:text-[#e8eaed]">Somente leitura</span>
+                <input
+                  type="checkbox"
+                  checked={mountSettingsDraft.readOnly}
+                  onChange={(e) => setMountSettingsDraft((s) => ({ ...s, readOnly: e.target.checked }))}
+                  className="w-4 h-4 accent-[#1a73e8] cursor-pointer"
+                />
+              </label>
+
+              <label className="flex items-start justify-between gap-3 cursor-pointer pt-1 border-t border-[#e8eaed] dark:border-white/10">
+                <span className="pt-3">
+                  <span className="block text-sm text-[#3c4043] dark:text-[#e8eaed]">
+                    Manter sempre montado
+                  </span>
+                  <span className="block text-[11px] text-[#9aa0a6] mt-0.5">
+                    Monta automaticamente ao abrir o app e remonta sozinho se a conexão cair.
+                  </span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={mountSettingsDraft.autoRemount}
+                  onChange={(e) => setMountSettingsDraft((s) => ({ ...s, autoRemount: e.target.checked }))}
+                  className="w-4 h-4 mt-3.5 accent-[#1a73e8] cursor-pointer shrink-0"
+                />
+              </label>
+            </div>
+
+            <div className="flex items-center justify-between px-6 py-4 bg-[#f8f9fa] dark:bg-[#202124]">
+              <p className="text-[11px] text-[#9aa0a6] max-w-[220px]">Aplica-se na próxima vez que montar.</p>
+              <button
+                onClick={saveMountSettingsAndClose}
+                className="gdrive-btn px-5 py-2 text-sm font-medium text-white bg-[#1a73e8] hover:bg-[#1765cc] rounded-full shadow-sm transition cursor-pointer"
+              >
+                Salvar
               </button>
             </div>
           </div>
