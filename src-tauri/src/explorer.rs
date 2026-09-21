@@ -113,44 +113,53 @@ pub async fn list_cloud_files_stream(
                 base.join(path.trim_start_matches('/'))
             };
 
-            match std::fs::read_dir(&target_dir) {
-                Ok(read_dir) => {
-                    let mut count = 0usize;
-                    for entry in read_dir.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        let meta = match entry.metadata() {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        let mod_time = meta
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| {
-                                chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0)
-                                    .map(|dt| dt.to_rfc3339())
-                                    .unwrap_or_default()
-                            })
-                            .unwrap_or_default();
+            // FUSE reads on an uncached directory still hit the network under
+            // the hood, so this must run on a blocking-safe thread (never
+            // std::fs directly inside an async fn) and be bounded: if the
+            // mount itself is stalled waiting on a throttled API call, fail
+            // fast and fall back to a fresh rclone lsjson instead of hanging.
+            let blocking_read = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<CloudEntry>> {
+                let mut out = Vec::new();
+                for entry in std::fs::read_dir(&target_dir)?.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let meta = match entry.metadata() {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let mod_time = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| {
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0)
+                                .map(|dt| dt.to_rfc3339())
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
 
-                        let cloud_entry = CloudEntry {
-                            name: name.clone(),
-                            path: name,
-                            size: if meta.is_dir() { 0 } else { meta.len() as i64 },
-                            is_dir: meta.is_dir(),
-                            mod_time,
-                        };
-                        count += 1;
-                        let _ = app.emit(&entry_event, cloud_entry);
-                    }
-                    let _ = app.emit(&done_event, count);
-                    return Ok(count);
+                    out.push(CloudEntry {
+                        name: name.clone(),
+                        path: name,
+                        size: if meta.is_dir() { 0 } else { meta.len() as i64 },
+                        is_dir: meta.is_dir(),
+                        mod_time,
+                    });
                 }
-                Err(_) => {
-                    // Mount point unreadable (e.g. still initializing) — fall
-                    // through to the normal rclone lsjson path below.
+                Ok(out)
+            });
+
+            if let Ok(Ok(Ok(entries))) =
+                tokio::time::timeout(std::time::Duration::from_secs(4), blocking_read).await
+            {
+                let count = entries.len();
+                for entry in entries {
+                    let _ = app.emit(&entry_event, entry);
                 }
+                let _ = app.emit(&done_event, count);
+                return Ok(count);
             }
+            // Timed out, join error, or read_dir error — fall through to the
+            // normal rclone lsjson path below.
         }
     }
 
