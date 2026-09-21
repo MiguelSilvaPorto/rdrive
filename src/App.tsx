@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
@@ -56,6 +57,10 @@ import {
   Database,
   Trash,
   Laptop,
+  RotateCcw,
+  Sparkles,
+  ArrowRight,
+  ArrowLeft,
 } from "lucide-react";
 import "./App.css";
 
@@ -160,6 +165,13 @@ export default function App() {
   const [installingRclone, setInstallingRclone] = useState(false);
 
   const [showSettings, setShowSettings] = useState(false);
+  const [onboardingStep, setOnboardingStep] = useState<number | null>(() =>
+    localStorage.getItem("rdrive-onboarding-done") ? null : 0
+  );
+  const finishOnboarding = () => {
+    localStorage.setItem("rdrive-onboarding-done", "1");
+    setOnboardingStep(null);
+  };
   const [autostartOn, setAutostartOn] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
 
@@ -392,22 +404,55 @@ export default function App() {
   const explorerJoin = (base: string, name: string) => (base ? `${base}/${name}` : name);
   const explorerBreadcrumbs = () => (explorerPath ? explorerPath.split("/").filter(Boolean) : []);
 
+  const explorerRequestId = useRef(0);
+  const explorerUnlisten = useRef<UnlistenFn[]>([]);
+  const explorerBuffer = useRef<CloudEntry[]>([]);
+  const explorerFlushScheduled = useRef(false);
+
   const loadExplorer = async (remote: string, path: string, categoryOverride?: string) => {
+    // Cancel any listeners from a previous, still-streaming navigation so its
+    // late-arriving entries don't leak into the folder the user is viewing now.
+    explorerUnlisten.current.forEach((fn) => fn());
+    explorerUnlisten.current = [];
+
+    const requestId = String(++explorerRequestId.current);
+    explorerBuffer.current = [];
     setExplorerLoading(true);
+    setExplorerEntries([]);
     setExplorerSelected(new Set());
     const cat = categoryOverride !== undefined ? categoryOverride : explorerActiveCategory;
+
+    const flush = () => {
+      if (explorerRequestId.current !== Number(requestId)) return;
+      setExplorerEntries([...explorerBuffer.current]);
+      explorerFlushScheduled.current = false;
+    };
+
+    const scheduleFlush = () => {
+      if (explorerFlushScheduled.current) return;
+      explorerFlushScheduled.current = true;
+      requestAnimationFrame(flush);
+    };
+
     try {
-      const entries = await invoke<CloudEntry[]>("list_cloud_files", {
-        remote,
-        path,
-        category: cat,
+      const unEntry = await listen<CloudEntry>(`explorer-entry-${requestId}`, (event) => {
+        if (explorerRequestId.current !== Number(requestId)) return;
+        explorerBuffer.current.push(event.payload);
+        scheduleFlush();
       });
-      setExplorerEntries(entries);
+      const unDone = await listen<number>(`explorer-done-${requestId}`, () => {
+        if (explorerRequestId.current !== Number(requestId)) return;
+        flush();
+        setExplorerLoading(false);
+      });
+      explorerUnlisten.current = [unEntry, unDone];
+
+      await invoke<number>("list_cloud_files_stream", { requestId, remote, path, category: cat });
     } catch (err: any) {
-      setMessage({ type: "error", text: String(err) });
-      setExplorerEntries([]);
-    } finally {
-      setExplorerLoading(false);
+      if (explorerRequestId.current === Number(requestId)) {
+        setMessage({ type: "error", text: String(err) });
+        setExplorerLoading(false);
+      }
     }
   };
 
@@ -439,6 +484,23 @@ export default function App() {
     setExplorerBusy(true);
     try {
       const res = await invoke<string>("empty_cloud_trash", { remote: explorerFor });
+      setMessage({ type: "success", text: res });
+      await loadExplorer(explorerFor, "", "trash");
+    } catch (err: any) {
+      setMessage({ type: "error", text: String(err) });
+    } finally {
+      setExplorerBusy(false);
+    }
+  };
+
+  const handleRestoreFromTrash = async (names: string[]) => {
+    if (!explorerFor || names.length === 0) return;
+    setExplorerBusy(true);
+    try {
+      const res = await invoke<string>("untrash_cloud_paths", {
+        remote: explorerFor,
+        paths: names,
+      });
       setMessage({ type: "success", text: res });
       await loadExplorer(explorerFor, "", "trash");
     } catch (err: any) {
@@ -997,8 +1059,11 @@ export default function App() {
                 <div>
                   <h1 className="text-base font-semibold text-[#202124] dark:text-[#e8eaed] flex items-center gap-2">
                     <span>{explorerFor}</span>
-                    <span className="text-xs px-2 py-0.5 rounded-full bg-[#1a73e8]/10 text-[#1a73e8] dark:text-[#8ab4f8] font-normal">
-                      {explorerEntries.length} item(ns)
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-[#1a73e8]/10 text-[#1a73e8] dark:text-[#8ab4f8] font-normal flex items-center gap-1">
+                      {explorerLoading && explorerEntries.length > 0 && (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      )}
+                      {explorerEntries.length} item(ns){explorerLoading && explorerEntries.length > 0 ? "..." : ""}
                     </span>
                   </h1>
                   <p className="text-[11px] text-[#5f6368] dark:text-[#9aa0a6]">
@@ -1045,15 +1110,30 @@ export default function App() {
 
               <div className="flex items-center flex-wrap gap-1 flex-1 overflow-x-auto py-0.5">
                 <button
-                  onClick={() => explorerNavigate("")}
+                  onClick={() => handleSelectCategory("mydrive")}
                   className={`gdrive-btn px-2.5 py-1 rounded-lg text-xs transition cursor-pointer font-medium ${
-                    !explorerPath
+                    !explorerPath && explorerActiveCategory === "mydrive"
                       ? "bg-[#1a73e8]/10 text-[#1a73e8] dark:text-[#8ab4f8] font-semibold"
                       : "text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10"
                   }`}
                 >
                   {explorerFor} (raiz)
                 </button>
+                {explorerActiveCategory !== "mydrive" && (
+                  <div className="flex items-center gap-1">
+                    <ChevronRight className="w-3.5 h-3.5 text-[#9aa0a6] shrink-0" />
+                    <span className="px-2.5 py-1 rounded-lg text-xs font-semibold bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff]">
+                      {explorerActiveCategory === "shared_with_me" && "Compartilhados comigo"}
+                      {explorerActiveCategory === "recent" && "Recentes"}
+                      {explorerActiveCategory === "starred" && "Com estrela"}
+                      {explorerActiveCategory === "trash" && "Lixeira"}
+                      {explorerActiveCategory === "shared" && "Drives compartilhados"}
+                      {explorerActiveCategory === "computers" && "Computadores"}
+                      {explorerActiveCategory === "spam" && "Spam"}
+                      {explorerActiveCategory === "storage" && "Armazenamento"}
+                    </span>
+                  </div>
+                )}
                 {explorerBreadcrumbs().map((segment, idx) => {
                   const path = explorerBreadcrumbs().slice(0, idx + 1).join("/");
                   const isLast = idx === explorerBreadcrumbs().length - 1;
@@ -1215,28 +1295,41 @@ export default function App() {
               {/* Ações em lote para seleção */}
               {explorerSelected.size > 0 && (
                 <div className="flex items-center space-x-1.5 ml-auto animate-scaleIn">
-                  <button
-                    onClick={() => {
-                      setExplorerTransferMode("copy");
-                      setExplorerDestInput(explorerPath);
-                    }}
-                    disabled={explorerBusy}
-                    className="gdrive-btn flex items-center space-x-1 px-3 py-1.5 text-xs font-medium text-[#1a73e8] dark:text-[#8ab4f8] bg-[#e8f0fe] dark:bg-[#1a73e8]/20 hover:bg-[#d2e3fc] rounded-full transition cursor-pointer disabled:opacity-50"
-                  >
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>Copiar</span>
-                  </button>
-                  <button
-                    onClick={() => {
-                      setExplorerTransferMode("move");
-                      setExplorerDestInput(explorerPath);
-                    }}
-                    disabled={explorerBusy}
-                    className="gdrive-btn flex items-center space-x-1 px-3 py-1.5 text-xs font-medium text-[#1a73e8] dark:text-[#8ab4f8] bg-[#e8f0fe] dark:bg-[#1a73e8]/20 hover:bg-[#d2e3fc] rounded-full transition cursor-pointer disabled:opacity-50"
-                  >
-                    <Move className="w-3.5 h-3.5" />
-                    <span>Mover</span>
-                  </button>
+                  {explorerActiveCategory === "trash" ? (
+                    <button
+                      onClick={() => handleRestoreFromTrash(Array.from(explorerSelected))}
+                      disabled={explorerBusy}
+                      className="gdrive-btn flex items-center space-x-1 px-3 py-1.5 text-xs font-medium text-[#1a73e8] dark:text-[#8ab4f8] bg-[#e8f0fe] dark:bg-[#1a73e8]/20 hover:bg-[#d2e3fc] rounded-full transition cursor-pointer disabled:opacity-50"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>Restaurar ({explorerSelected.size})</span>
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => {
+                          setExplorerTransferMode("copy");
+                          setExplorerDestInput(explorerPath);
+                        }}
+                        disabled={explorerBusy}
+                        className="gdrive-btn flex items-center space-x-1 px-3 py-1.5 text-xs font-medium text-[#1a73e8] dark:text-[#8ab4f8] bg-[#e8f0fe] dark:bg-[#1a73e8]/20 hover:bg-[#d2e3fc] rounded-full transition cursor-pointer disabled:opacity-50"
+                      >
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>Copiar</span>
+                      </button>
+                      <button
+                        onClick={() => {
+                          setExplorerTransferMode("move");
+                          setExplorerDestInput(explorerPath);
+                        }}
+                        disabled={explorerBusy}
+                        className="gdrive-btn flex items-center space-x-1 px-3 py-1.5 text-xs font-medium text-[#1a73e8] dark:text-[#8ab4f8] bg-[#e8f0fe] dark:bg-[#1a73e8]/20 hover:bg-[#d2e3fc] rounded-full transition cursor-pointer disabled:opacity-50"
+                      >
+                        <Move className="w-3.5 h-3.5" />
+                        <span>Mover</span>
+                      </button>
+                    </>
+                  )}
                   <button
                     onClick={handleExplorerDelete}
                     disabled={explorerBusy}
@@ -1311,7 +1404,60 @@ export default function App() {
 
             {/* Lista e Grade de Arquivos */}
             <div className="flex-1 overflow-y-auto p-6">
-              {explorerLoading ? (
+              {/* Visualização Especial: Painel de Armazenamento */}
+              {explorerActiveCategory === "storage" && explorerQuota && (
+                <div className="mb-6 p-6 rounded-2xl bg-[#f8f9fa] dark:bg-white/5 border border-[#e8eaed] dark:border-white/10 animate-fadeIn">
+                  <div className="flex items-center space-x-3 mb-4">
+                    <div className="p-3 rounded-2xl bg-[#1a73e8]/10 text-[#1a73e8] dark:text-[#8ab4f8]">
+                      <Database className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <h2 className="text-base font-semibold text-[#202124] dark:text-[#e8eaed]">
+                        Gerenciamento de Armazenamento
+                      </h2>
+                      <p className="text-xs text-[#5f6368] dark:text-[#9aa0a6]">
+                        Uso total de espaço na nuvem do Google Drive
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2 mb-4">
+                    <div className="flex justify-between text-xs font-medium">
+                      <span className="text-[#3c4043] dark:text-[#e8eaed]">
+                        {formatBytes(explorerQuota.used || 0)} utilizados
+                      </span>
+                      <span className="text-[#5f6368] dark:text-[#9aa0a6]">
+                        {formatBytes(explorerQuota.total || 0)} disponíveis
+                      </span>
+                    </div>
+                    <div className="w-full h-3 bg-[#e8eaed] dark:bg-white/10 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-gradient-to-r from-[#1a73e8] to-[#4285f4] rounded-full transition-all duration-700"
+                        style={{
+                          width: `${Math.min(
+                            100,
+                            Math.round(((explorerQuota.used || 0) / (explorerQuota.total || 1)) * 100)
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between text-[11px] text-[#5f6368] dark:text-[#9aa0a6] pt-1">
+                      <span>
+                        Livre: {formatBytes(explorerQuota.free || (explorerQuota.total || 0) - (explorerQuota.used || 0))}
+                      </span>
+                      <span>
+                        {Math.round(((explorerQuota.used || 0) / (explorerQuota.total || 1)) * 100)}% ocupado
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="text-xs text-[#5f6368] dark:text-[#9aa0a6] pt-2 border-t border-[#e8eaed] dark:border-white/10">
+                    💡 Abaixo você encontra os arquivos listados na raiz da sua nuvem ordenados por tamanho para facilitar a liberação de espaço.
+                  </div>
+                </div>
+              )}
+
+              {explorerLoading && explorerEntries.length === 0 ? (
                 <div className="space-y-3">
                   {[1, 2, 3, 4, 5, 6].map((i) => (
                     <div key={i} className="skeleton h-12 rounded-xl" />
@@ -1333,11 +1479,75 @@ export default function App() {
 
                 if (filtered.length === 0) {
                   return (
-                    <div className="flex flex-col items-center justify-center h-full text-center py-16">
-                      <FolderIcon className="w-12 h-12 text-[#dadce0] dark:text-white/10 mb-3" />
-                      <p className="text-sm font-medium text-[#5f6368] dark:text-[#9aa0a6]">
-                        {explorerSearch ? `Nenhum arquivo correspondente a "${explorerSearch}"` : "Esta pasta está vazia."}
-                      </p>
+                    <div className="flex flex-col items-center justify-center h-full text-center py-16 animate-fadeIn">
+                      {explorerActiveCategory === "trash" ? (
+                        <>
+                          <div className="w-16 h-16 rounded-full bg-[#fce8e6] dark:bg-[#d93025]/10 flex items-center justify-center text-[#d93025] mb-3">
+                            <Trash className="w-8 h-8" />
+                          </div>
+                          <h3 className="text-sm font-semibold text-[#202124] dark:text-[#e8eaed] mb-1">
+                            A lixeira está vazia
+                          </h3>
+                          <p className="text-xs text-[#5f6368] dark:text-[#9aa0a6] max-w-sm">
+                            Os itens excluídos da sua nuvem aparecerão aqui antes de serem permanentemente removidos.
+                          </p>
+                        </>
+                      ) : explorerActiveCategory === "shared" ? (
+                        <>
+                          <div className="w-16 h-16 rounded-full bg-[#e8f0fe] dark:bg-[#1a73e8]/10 flex items-center justify-center text-[#1a73e8] dark:text-[#8ab4f8] mb-3">
+                            <Users className="w-8 h-8" />
+                          </div>
+                          <h3 className="text-sm font-semibold text-[#202124] dark:text-[#e8eaed] mb-1">
+                            Nenhum drive compartilhado
+                          </h3>
+                          <p className="text-xs text-[#5f6368] dark:text-[#9aa0a6] max-w-sm">
+                            Esta conta de nuvem não possui Team Drives ou Drives Compartilhados vinculados no momento.
+                          </p>
+                        </>
+                      ) : explorerActiveCategory === "computers" ? (
+                        <>
+                          <div className="w-16 h-16 rounded-full bg-[#f1f3f4] dark:bg-white/10 flex items-center justify-center text-[#5f6368] dark:text-[#e8eaed] mb-3">
+                            <Laptop className="w-8 h-8" />
+                          </div>
+                          <h3 className="text-sm font-semibold text-[#202124] dark:text-[#e8eaed] mb-1">
+                            Nenhum computador sincronizando
+                          </h3>
+                          <p className="text-xs text-[#5f6368] dark:text-[#9aa0a6] max-w-sm">
+                            Pastas locais sincronizadas automaticamente através do aplicativo de backup do Google Drive aparecerão aqui.
+                          </p>
+                        </>
+                      ) : explorerActiveCategory === "starred" ? (
+                        <>
+                          <div className="w-16 h-16 rounded-full bg-amber-50 dark:bg-amber-500/10 flex items-center justify-center text-amber-500 mb-3">
+                            <Star className="w-8 h-8" />
+                          </div>
+                          <h3 className="text-sm font-semibold text-[#202124] dark:text-[#e8eaed] mb-1">
+                            Nenhum item com estrela
+                          </h3>
+                          <p className="text-xs text-[#5f6368] dark:text-[#9aa0a6] max-w-sm">
+                            Adicione estrelas a arquivos e pastas no seu Google Drive para encontrá-los facilmente aqui.
+                          </p>
+                        </>
+                      ) : explorerActiveCategory === "spam" ? (
+                        <>
+                          <div className="w-16 h-16 rounded-full bg-orange-50 dark:bg-orange-500/10 flex items-center justify-center text-orange-500 mb-3">
+                            <AlertCircle className="w-8 h-8" />
+                          </div>
+                          <h3 className="text-sm font-semibold text-[#202124] dark:text-[#e8eaed] mb-1">
+                            Nenhum spam encontrado
+                          </h3>
+                          <p className="text-xs text-[#5f6368] dark:text-[#9aa0a6] max-w-sm">
+                            Arquivos marcados como spam ou suspeitos compartilhados com você são filtrados para cá.
+                          </p>
+                        </>
+                      ) : (
+                        <>
+                          <FolderIcon className="w-12 h-12 text-[#dadce0] dark:text-white/10 mb-3" />
+                          <p className="text-sm font-medium text-[#5f6368] dark:text-[#9aa0a6]">
+                            {explorerSearch ? `Nenhum arquivo correspondente a "${explorerSearch}"` : "Esta pasta está vazia."}
+                          </p>
+                        </>
+                      )}
                     </div>
                   );
                 }
@@ -1397,40 +1607,53 @@ export default function App() {
                             </span>
 
                             {/* Ações rápidas ao passar o mouse */}
-                            {!entry.IsDir && (
-                              <div className="mt-2 pt-2 border-t border-[#e8eaed]/50 dark:border-white/5 w-full flex items-center justify-center space-x-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <div className="mt-2 pt-2 border-t border-[#e8eaed]/50 dark:border-white/5 w-full flex items-center justify-center space-x-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                              {explorerActiveCategory === "trash" ? (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    handleExplorerPreview(entry.Name);
+                                    handleRestoreFromTrash([entry.Name]);
                                   }}
-                                  className="p-1 rounded-full text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10"
-                                  title="Prévia"
+                                  className="p-1 rounded-full text-[#1a73e8] dark:text-[#8ab4f8] hover:bg-[#e8f0fe] dark:hover:bg-[#1a73e8]/20"
+                                  title="Restaurar este item"
                                 >
-                                  <Eye className="w-3.5 h-3.5" />
+                                  <RotateCcw className="w-3.5 h-3.5" />
                                 </button>
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleExplorerDownload(entry.Name);
-                                  }}
-                                  className="p-1 rounded-full text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10"
-                                  title="Baixar para Downloads"
-                                >
-                                  <Download className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleExplorerShareLink(entry.Name);
-                                  }}
-                                  className="p-1 rounded-full text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10"
-                                  title="Copiar Link"
-                                >
-                                  <Link2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            )}
+                              ) : !entry.IsDir ? (
+                                <>
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleExplorerPreview(entry.Name);
+                                    }}
+                                    className="p-1 rounded-full text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                                    title="Prévia"
+                                  >
+                                    <Eye className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleExplorerDownload(entry.Name);
+                                    }}
+                                    className="p-1 rounded-full text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                                    title="Baixar para Downloads"
+                                  >
+                                    <Download className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleExplorerShareLink(entry.Name);
+                                    }}
+                                    className="p-1 rounded-full text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                                    title="Copiar Link"
+                                  >
+                                    <Link2 className="w-3.5 h-3.5" />
+                                  </button>
+                                </>
+                              ) : null}
+                            </div>
                           </div>
                         );
                       })}
@@ -1501,40 +1724,53 @@ export default function App() {
                                 {entry.ModTime ? new Date(entry.ModTime).toLocaleDateString() : "—"}
                               </td>
                               <td className="pr-4 py-3 text-right">
-                                {!entry.IsDir && (
-                                  <div className="flex items-center justify-end space-x-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <div className="flex items-center justify-end space-x-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                  {explorerActiveCategory === "trash" ? (
                                     <button
                                       onClick={(e) => {
                                         e.stopPropagation();
-                                        handleExplorerPreview(entry.Name);
+                                        handleRestoreFromTrash([entry.Name]);
                                       }}
-                                      className="p-1 text-[#5f6368] dark:text-[#e8eaed] hover:text-[#1a73e8] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
-                                      title="Prévia"
+                                      className="p-1 text-[#1a73e8] dark:text-[#8ab4f8] hover:bg-[#e8f0fe] dark:hover:bg-[#1a73e8]/20 rounded-full transition cursor-pointer"
+                                      title="Restaurar este item"
                                     >
-                                      <Eye className="w-3.5 h-3.5" />
+                                      <RotateCcw className="w-3.5 h-3.5" />
                                     </button>
-                                    <button
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleExplorerDownload(entry.Name);
-                                      }}
-                                      className="p-1 text-[#5f6368] dark:text-[#e8eaed] hover:text-[#1a73e8] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
-                                      title="Baixar para pasta Downloads"
-                                    >
-                                      <Download className="w-3.5 h-3.5" />
-                                    </button>
-                                    <button
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleExplorerShareLink(entry.Name);
-                                      }}
-                                      className="p-1 text-[#5f6368] dark:text-[#e8eaed] hover:text-[#1a73e8] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
-                                      title="Gerar link de compartilhamento"
-                                    >
-                                      <Link2 className="w-3.5 h-3.5" />
-                                    </button>
-                                  </div>
-                                )}
+                                  ) : !entry.IsDir ? (
+                                    <>
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleExplorerPreview(entry.Name);
+                                        }}
+                                        className="p-1 text-[#5f6368] dark:text-[#e8eaed] hover:text-[#1a73e8] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                                        title="Prévia"
+                                      >
+                                        <Eye className="w-3.5 h-3.5" />
+                                      </button>
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleExplorerDownload(entry.Name);
+                                        }}
+                                        className="p-1 text-[#5f6368] dark:text-[#e8eaed] hover:text-[#1a73e8] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                                        title="Baixar para pasta Downloads"
+                                      >
+                                        <Download className="w-3.5 h-3.5" />
+                                      </button>
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleExplorerShareLink(entry.Name);
+                                        }}
+                                        className="p-1 text-[#5f6368] dark:text-[#e8eaed] hover:text-[#1a73e8] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                                        title="Gerar link de compartilhamento"
+                                      >
+                                        <Link2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </>
+                                  ) : null}
+                                </div>
                               </td>
                             </tr>
                           );
@@ -1633,8 +1869,34 @@ export default function App() {
             </div>
           )}
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {remotes.map((remote, idx) => {
+          {(() => {
+            const groups = new Map<string, RemoteDrive[]>();
+            for (const r of remotes) {
+              const list = groups.get(r.type) || [];
+              list.push(r);
+              groups.set(r.type, list);
+            }
+            const groupEntries = [...groups.entries()];
+            const showGroupHeaders = groupEntries.length > 1;
+
+            return groupEntries.map(([type, group]) => (
+              <div key={type} className="mb-6 last:mb-0">
+                {showGroupHeaders && (
+                  <div className="flex items-center space-x-2 mb-3">
+                    <div
+                      className="w-6 h-6 rounded-md flex items-center justify-center text-white text-[10px] font-bold shadow-sm"
+                      style={{ background: providerStyle(type).gradient }}
+                    >
+                      {providerStyle(type).label}
+                    </div>
+                    <h2 className="text-sm font-semibold text-[#3c4043] dark:text-[#e8eaed] capitalize">{type}</h2>
+                    <span className="text-xs text-[#9aa0a6]">
+                      {group.length} {group.length === 1 ? "conta" : "contas"}
+                    </span>
+                  </div>
+                )}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {group.map((remote, idx) => {
               const isAction = actionLoading === remote.name;
               return (
                 <div
@@ -1737,8 +1999,11 @@ export default function App() {
                   </div>
                 </div>
               );
-            })}
-          </div>
+                  })}
+                </div>
+              </div>
+            ));
+          })()}
           </>
           )}
         </main>
@@ -1850,8 +2115,8 @@ export default function App() {
       {mountSettingsFor && (
         <div className="fixed inset-0 z-40 flex items-center justify-center">
           <div className="absolute inset-0 bg-black/40 animate-fadeIn" onClick={() => setMountSettingsFor(null)} />
-          <div className="relative animate-scaleIn bg-white dark:bg-[#2d2e30] rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
-            <div className="flex items-center justify-between px-6 pt-5 pb-4 border-b border-[#e8eaed] dark:border-white/10">
+          <div className="relative animate-scaleIn bg-white dark:bg-[#2d2e30] rounded-2xl shadow-2xl w-full max-w-md mx-4 max-h-[85vh] flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-6 pt-5 pb-4 border-b border-[#e8eaed] dark:border-white/10 shrink-0">
               <h2 className="text-lg font-medium text-[#202124] dark:text-[#e8eaed]">
                 Montagem de <span className="text-[#1a73e8] dark:text-[#8ab4f8]">{mountSettingsFor}</span>
               </h2>
@@ -1863,7 +2128,7 @@ export default function App() {
               </button>
             </div>
 
-            <div className="px-6 py-5 space-y-5">
+            <div className="px-6 py-5 space-y-5 overflow-y-auto">
               <div>
                 <label className="block text-xs font-medium text-[#5f6368] dark:text-[#9aa0a6] mb-1.5">
                   Ponto de montagem (opcional)
@@ -1973,7 +2238,7 @@ export default function App() {
               </label>
             </div>
 
-            <div className="flex items-center justify-between px-6 py-4 bg-[#f8f9fa] dark:bg-[#202124]">
+            <div className="flex items-center justify-between px-6 py-4 bg-[#f8f9fa] dark:bg-[#202124] shrink-0">
               <p className="text-[11px] text-[#9aa0a6] max-w-[220px]">Aplica-se na próxima vez que montar.</p>
               <button
                 onClick={saveMountSettingsAndClose}
@@ -2164,6 +2429,93 @@ export default function App() {
                 </div>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Onboarding de primeira execução */}
+      {onboardingStep !== null && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/50 animate-fadeIn" />
+          <div className="relative animate-scaleIn bg-white dark:bg-[#2d2e30] rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+            {(() => {
+              const steps = [
+                {
+                  icon: Sparkles,
+                  title: "Bem-vindo ao Rdrive",
+                  body: "Monte as suas nuvens como se fossem discos locais, com cache inteligente, montagem automática e um explorador completo. Vamos configurar em 3 passos rápidos.",
+                },
+                {
+                  icon: CheckCircle2,
+                  title: "1. Verifique o rclone",
+                  body: status?.rclone_installed
+                    ? "O rclone já está instalado neste computador — tudo pronto para o próximo passo."
+                    : "O Rdrive usa o rclone por baixo. Se ainda não estiver instalado, um aviso no topo da tela vai te oferecer instalação com um clique.",
+                },
+                {
+                  icon: Cloud,
+                  title: "2. Conecte sua primeira nuvem",
+                  body: "Clique em \"Nova Nuvem\" na barra lateral, escolha o provedor (Google Drive, Dropbox, OneDrive...) e autorize pelo navegador. Nenhuma senha passa pelo Rdrive.",
+                },
+                {
+                  icon: HardDrive,
+                  title: "3. Monte e explore",
+                  body: "Clique em \"Montar\" para usar a nuvem como um disco comum, ou no ícone de pasta para abrir o explorador com busca, cópia, prévia e muito mais.",
+                },
+              ];
+              const step = steps[onboardingStep];
+              const Icon = step.icon;
+              const isLast = onboardingStep === steps.length - 1;
+
+              return (
+                <>
+                  <div className="px-7 pt-8 pb-6 text-center">
+                    <div className="w-14 h-14 mx-auto rounded-2xl bg-[#e8f0fe] dark:bg-[#1a73e8]/20 text-[#1a73e8] dark:text-[#8ab4f8] flex items-center justify-center mb-4">
+                      <Icon className="w-7 h-7" />
+                    </div>
+                    <h2 className="text-lg font-semibold text-[#202124] dark:text-[#e8eaed] mb-2">{step.title}</h2>
+                    <p className="text-sm text-[#5f6368] dark:text-[#9aa0a6] leading-relaxed">{step.body}</p>
+                  </div>
+
+                  <div className="flex items-center justify-center gap-1.5 pb-5">
+                    {steps.map((_, i) => (
+                      <span
+                        key={i}
+                        className={`h-1.5 rounded-full transition-all ${
+                          i === onboardingStep ? "w-6 bg-[#1a73e8] dark:bg-[#8ab4f8]" : "w-1.5 bg-[#dadce0] dark:bg-white/20"
+                        }`}
+                      />
+                    ))}
+                  </div>
+
+                  <div className="flex items-center justify-between px-6 py-4 bg-[#f8f9fa] dark:bg-[#202124]">
+                    <button
+                      onClick={finishOnboarding}
+                      className="gdrive-btn px-3 py-2 text-xs font-medium text-[#5f6368] dark:text-[#9aa0a6] hover:text-[#202124] dark:hover:text-white transition cursor-pointer"
+                    >
+                      Pular
+                    </button>
+                    <div className="flex items-center gap-2">
+                      {onboardingStep > 0 && (
+                        <button
+                          onClick={() => setOnboardingStep((s) => (s ?? 1) - 1)}
+                          className="gdrive-btn p-2 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                        >
+                          <ArrowLeft className="w-4 h-4" />
+                        </button>
+                      )}
+                      <button
+                        onClick={() => (isLast ? finishOnboarding() : setOnboardingStep((s) => (s ?? 0) + 1))}
+                        className="gdrive-btn flex items-center space-x-1.5 px-5 py-2 text-sm font-medium text-white bg-[#1a73e8] hover:bg-[#1765cc] rounded-full shadow-sm transition cursor-pointer"
+                      >
+                        <span>{isLast ? "Começar" : "Próximo"}</span>
+                        <ArrowRight className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
           </div>
         </div>
       )}

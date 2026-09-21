@@ -4,7 +4,8 @@ mod transfers;
 
 use explorer::{
     create_cloud_folder, create_share_link, delete_cloud_paths, download_cloud_file,
-    empty_cloud_trash, list_cloud_files, preview_cloud_file, transfer_cloud_path,
+    empty_cloud_trash, list_cloud_files, list_cloud_files_stream, list_shared_drives,
+    preview_cloud_file, transfer_cloud_path, untrash_cloud_paths,
 };
 use rclone::{
     check_system_environment, create_remote_oauth, delete_remote, get_remote_about,
@@ -66,6 +67,7 @@ pub fn run() {
             pause_transfer,
             cancel_transfer,
             list_cloud_files,
+            list_cloud_files_stream,
             delete_cloud_paths,
             transfer_cloud_path,
             create_cloud_folder,
@@ -73,6 +75,8 @@ pub fn run() {
             download_cloud_file,
             preview_cloud_file,
             empty_cloud_trash,
+            list_shared_drives,
+            untrash_cloud_paths,
         ])
         .setup(|app| {
             let toggle_shortcut = Shortcut::new(Some(Modifiers::SHIFT | Modifiers::ALT), Code::KeyD);

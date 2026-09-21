@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
+use tokio::io::AsyncBufReadExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudEntry {
@@ -37,6 +39,10 @@ pub async fn list_cloud_files(
     let cat = category.unwrap_or_else(|| "mydrive".to_string());
     let mut args: Vec<String> = vec!["lsjson".to_string()];
 
+    // Limita a profundidade para 1 nível (navegação rápida de diretório / categoria)
+    args.push("--max-depth".to_string());
+    args.push("1".to_string());
+
     match cat.as_str() {
         "shared_with_me" => {
             args.push("--drive-shared-with-me".to_string());
@@ -66,6 +72,124 @@ pub async fn list_cloud_files(
     }
 
     Ok(entries)
+}
+
+/// Streams the contents of a cloud folder as they arrive from rclone, instead of
+/// waiting for the whole listing to finish. Emits `explorer-entry-{request_id}`
+/// for each item and `explorer-done-{request_id}` with the total count at the end,
+/// so the UI can render files progressively rather than freezing on a spinner.
+#[tauri::command]
+pub async fn list_cloud_files_stream(
+    app: tauri::AppHandle,
+    request_id: String,
+    remote: String,
+    path: String,
+    category: Option<String>,
+) -> Result<usize, String> {
+    let cat = category.unwrap_or_else(|| "mydrive".to_string());
+    let entry_event = format!("explorer-entry-{request_id}");
+    let done_event = format!("explorer-done-{request_id}");
+
+    if cat == "shared" {
+        let drives = list_shared_drives(remote).await?;
+        for d in &drives {
+            let entry = CloudEntry {
+                name: d.name.clone(),
+                size: 0,
+                is_dir: true,
+                mod_time: String::new(),
+            };
+            let _ = app.emit(&entry_event, entry);
+        }
+        let _ = app.emit(&done_event, drives.len());
+        return Ok(drives.len());
+    }
+
+    let mut args: Vec<String> = vec!["lsjson".to_string(), "--max-depth".to_string(), "1".to_string()];
+    match cat.as_str() {
+        "shared_with_me" => args.push("--drive-shared-with-me".to_string()),
+        "trash" => args.push("--drive-trashed-only".to_string()),
+        "starred" => args.push("--drive-starred-only".to_string()),
+        _ => {}
+    }
+    let target = format!("{}:{}", remote, path.trim_start_matches('/'));
+    args.push(target);
+
+    let mut child = tokio::process::Command::new("rclone")
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Falha ao executar rclone: {e}"))?;
+
+    let stdout = child.stdout.take().ok_or("stdout indisponível")?;
+    let mut reader = tokio::io::BufReader::new(stdout).lines();
+    let mut count = 0usize;
+
+    while let Ok(Some(line)) = reader.next_line().await {
+        let trimmed = line.trim().trim_end_matches(',');
+        if trimmed.is_empty() || trimmed == "[" || trimmed == "]" {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<CloudEntry>(trimmed) {
+            count += 1;
+            let _ = app.emit(&entry_event, entry);
+        }
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Falha ao aguardar rclone: {e}"))?;
+
+    if !status.success() {
+        let mut stderr_buf = String::new();
+        if let Some(mut se) = child.stderr.take() {
+            use tokio::io::AsyncReadExt;
+            let _ = se.read_to_string(&mut stderr_buf).await;
+        }
+        let msg = if stderr_buf.trim().is_empty() {
+            "Falha ao listar arquivos.".to_string()
+        } else {
+            stderr_buf.trim().to_string()
+        };
+        return Err(msg);
+    }
+
+    let _ = app.emit(&done_event, count);
+    Ok(count)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedDriveEntry {
+    pub id: String,
+    pub name: String,
+}
+
+/// Lists shared team drives for Google Drive
+#[tauri::command]
+pub async fn list_shared_drives(remote: String) -> Result<Vec<SharedDriveEntry>, String> {
+    let target = format!("{}:", remote);
+    let out = match run_rclone(&["backend", "drives", &target]).await {
+        Ok(o) => o,
+        Err(_) => return Ok(vec![]),
+    };
+
+    // Parse JSON array of drives
+    let drives: Vec<SharedDriveEntry> = serde_json::from_str(&out).unwrap_or_default();
+    Ok(drives)
+}
+
+/// Restores / untrashes files from Google Drive trash
+#[tauri::command]
+pub async fn untrash_cloud_paths(remote: String, paths: Vec<String>) -> Result<String, String> {
+    let mut count = 0;
+    for path in &paths {
+        let p = path.trim_start_matches('/');
+        let _ = run_rclone(&["backend", "untrash", &format!("{}:", remote), p]).await;
+        count += 1;
+    }
+    Ok(format!("{count} item(ns) restaurado(s) com sucesso."))
 }
 
 /// Empties trash for cloud remotes supporting cleanup (e.g. Google Drive)
