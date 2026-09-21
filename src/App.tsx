@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import {
   Cloud,
   HardDrive,
@@ -35,6 +36,25 @@ import {
   FolderPlus,
   CheckSquare,
   Square as SquareEmptyIcon,
+  Search,
+  LayoutGrid,
+  List,
+  Eye,
+  Link2,
+  FileText,
+  Image as ImageIcon,
+  Video as VideoIcon,
+  Music as MusicIcon,
+  Archive,
+  Code as CodeIcon,
+  ArrowUp,
+  Users,
+  Clock,
+  Star,
+  AlertCircle,
+  Database,
+  Trash,
+  Laptop,
 } from "lucide-react";
 import "./App.css";
 
@@ -47,6 +67,7 @@ interface MountSettings {
   cacheMaxSizeGb: number;
   cacheDir: string;
   autoRemount: boolean;
+  bwLimitMbps: number;
 }
 
 const DEFAULT_MOUNT_SETTINGS: MountSettings = {
@@ -56,6 +77,7 @@ const DEFAULT_MOUNT_SETTINGS: MountSettings = {
   cacheMaxSizeGb: 10,
   cacheDir: "",
   autoRemount: false,
+  bwLimitMbps: 0,
 };
 
 const CACHE_MODES: { id: MountSettings["vfsCacheMode"]; label: string; hint: string }[] = [
@@ -149,6 +171,20 @@ export default function App() {
   const [explorerTransferMode, setExplorerTransferMode] = useState<"copy" | "move" | null>(null);
   const [explorerDestInput, setExplorerDestInput] = useState("");
   const [explorerNewFolder, setExplorerNewFolder] = useState<string | null>(null);
+  const [explorerSearch, setExplorerSearch] = useState("");
+  const [explorerViewMode, setExplorerViewMode] = useState<"list" | "grid">("list");
+  const [explorerSortField, setExplorerSortField] = useState<"name" | "size" | "date">("name");
+  const [explorerSortOrder, setExplorerSortOrder] = useState<"asc" | "desc">("asc");
+  const [explorerPreview, setExplorerPreview] = useState<{
+    name: string;
+    path: string;
+    is_text: boolean;
+    content: string | null;
+    size: number;
+    loading: boolean;
+  } | null>(null);
+  const [explorerActiveCategory, setExplorerActiveCategory] = useState<string>("mydrive");
+  const [explorerQuota, setExplorerQuota] = useState<{ total: number | null; used: number | null; free: number | null } | null>(null);
   const [theme, setTheme] = useState<ThemeId>(() => (localStorage.getItem("rdrive-theme") as ThemeId) || "light");
 
   useEffect(() => {
@@ -170,6 +206,16 @@ export default function App() {
 
   const autoRemountInFlight = useRef<Set<string>>(new Set());
 
+  const everMounted = useRef<Set<string>>(new Set());
+
+  const notify = async (title: string, body: string) => {
+    try {
+      let granted = await isPermissionGranted();
+      if (!granted) granted = (await requestPermission()) === "granted";
+      if (granted) sendNotification({ title, body });
+    } catch {}
+  };
+
   const fetchStatusAndRemotes = async () => {
     setLoading(true);
     try {
@@ -181,14 +227,27 @@ export default function App() {
         setRemotes(remoteList);
 
         for (const remote of remoteList) {
-          if (remote.is_mounted || autoRemountInFlight.current.has(remote.name)) continue;
+          if (remote.is_mounted) {
+            everMounted.current.add(remote.name);
+            continue;
+          }
+          if (autoRemountInFlight.current.has(remote.name)) continue;
           const settings = loadMountSettings(remote.name);
           if (!settings.autoRemount) continue;
 
+          const wasMounted = everMounted.current.has(remote.name);
+          if (wasMounted) {
+            notify("Rdrive", `A nuvem "${remote.name}" caiu. Tentando remontar automaticamente...`);
+          }
+
           autoRemountInFlight.current.add(remote.name);
-          handleMount(remote.name, { silent: true }).finally(() => {
-            autoRemountInFlight.current.delete(remote.name);
-          });
+          handleMount(remote.name, { silent: true })
+            .then(() => {
+              if (wasMounted) notify("Rdrive", `Nuvem "${remote.name}" remontada com sucesso.`);
+            })
+            .finally(() => {
+              autoRemountInFlight.current.delete(remote.name);
+            });
         }
       }
     } catch (err: any) {
@@ -263,7 +322,7 @@ export default function App() {
     }
   };
 
-  const handleMount = async (remoteName: string, opts?: { silent?: boolean }) => {
+  const handleMount = async (remoteName: string, opts?: { silent?: boolean }): Promise<boolean> => {
     const silent = opts?.silent ?? false;
     if (!silent) {
       setActionLoading(remoteName);
@@ -278,6 +337,7 @@ export default function App() {
         readOnly: settings.readOnly,
         vfsCacheMaxSizeGb: settings.vfsCacheMode === "off" ? null : settings.cacheMaxSizeGb,
         cacheDir: settings.cacheDir.trim() || null,
+        bwlimitMbps: settings.bwLimitMbps > 0 ? settings.bwLimitMbps : null,
       });
       if (silent) {
         const remoteList = await invoke<RemoteDrive[]>("list_remotes");
@@ -286,8 +346,10 @@ export default function App() {
         setMessage({ type: "success", text: res });
         await fetchStatusAndRemotes();
       }
+      return true;
     } catch (err: any) {
       setMessage({ type: "error", text: silent ? `Auto-remontagem falhou para '${remoteName}': ${err}` : String(err) });
+      return false;
     } finally {
       if (!silent) setActionLoading(null);
     }
@@ -323,9 +385,15 @@ export default function App() {
   const openExplorer = (remote: string) => {
     setExplorerFor(remote);
     setExplorerPath("");
+    setExplorerActiveCategory("mydrive");
     setExplorerTransferMode(null);
     setExplorerNewFolder(null);
     loadExplorer(remote, "");
+
+    // Busca cota / armazenamento do drive em segundo plano
+    invoke<{ total: number | null; used: number | null; free: number | null }>("get_remote_about", { remote })
+      .then((res) => setExplorerQuota(res))
+      .catch(() => setExplorerQuota(null));
   };
 
   const explorerNavigate = (path: string) => {
@@ -342,9 +410,25 @@ export default function App() {
     });
   };
 
+  const visibleExplorerEntries = (() => {
+    let list = explorerEntries;
+    if (explorerSearch.trim()) {
+      const q = explorerSearch.trim().toLowerCase();
+      list = list.filter((e) => e.Name.toLowerCase().includes(q));
+    }
+    const dir = explorerSortOrder === "asc" ? 1 : -1;
+    return [...list].sort((a, b) => {
+      if (a.IsDir !== b.IsDir) return a.IsDir ? -1 : 1;
+      if (explorerSortField === "size") return (a.Size - b.Size) * dir;
+      if (explorerSortField === "date") return (new Date(a.ModTime).getTime() - new Date(b.ModTime).getTime()) * dir;
+      return a.Name.toLowerCase().localeCompare(b.Name.toLowerCase()) * dir;
+    });
+  })();
+
+
   const toggleExplorerSelectAll = () => {
     setExplorerSelected((prev) =>
-      prev.size === explorerEntries.length ? new Set() : new Set(explorerEntries.map((e) => e.Name))
+      prev.size === visibleExplorerEntries.length ? new Set() : new Set(visibleExplorerEntries.map((e) => e.Name))
     );
   };
 
@@ -410,6 +494,85 @@ export default function App() {
     } finally {
       setExplorerBusy(false);
     }
+  };
+
+  const handleExplorerDownload = async (fileName: string) => {
+    if (!explorerFor) return;
+    setExplorerBusy(true);
+    try {
+      const fullPath = explorerJoin(explorerPath, fileName);
+      const res = await invoke<string>("download_cloud_file", { remote: explorerFor, path: fullPath });
+      setMessage({ type: "success", text: res });
+    } catch (err: any) {
+      setMessage({ type: "error", text: String(err) });
+    } finally {
+      setExplorerBusy(false);
+    }
+  };
+
+  const handleExplorerShareLink = async (fileName: string) => {
+    if (!explorerFor) return;
+    try {
+      const fullPath = explorerJoin(explorerPath, fileName);
+      const link = await invoke<string>("create_share_link", { remote: explorerFor, path: fullPath });
+      if (link && navigator.clipboard) {
+        await navigator.clipboard.writeText(link);
+        setMessage({ type: "success", text: `Link copiado para a área de transferência: ${link}` });
+      } else {
+        setMessage({ type: "success", text: `Link gerado: ${link}` });
+      }
+    } catch (err: any) {
+      setMessage({ type: "error", text: `Compartilhamento: ${err}` });
+    }
+  };
+
+  const handleExplorerPreview = async (fileName: string) => {
+    if (!explorerFor) return;
+    const fullPath = explorerJoin(explorerPath, fileName);
+    setExplorerPreview({
+      name: fileName,
+      path: fullPath,
+      is_text: true,
+      content: null,
+      size: 0,
+      loading: true,
+    });
+    try {
+      const preview = await invoke<{ name: string; is_text: boolean; content: string | null; size: number }>(
+        "preview_cloud_file",
+        { remote: explorerFor, path: fullPath }
+      );
+      setExplorerPreview({
+        name: preview.name,
+        path: fullPath,
+        is_text: preview.is_text,
+        content: preview.content,
+        size: preview.size,
+        loading: false,
+      });
+    } catch (err: any) {
+      setExplorerPreview((prev) =>
+        prev
+          ? {
+              ...prev,
+              loading: false,
+              is_text: false,
+              content: `Não foi possível carregar a prévia: ${err}`,
+            }
+          : null
+      );
+    }
+  };
+
+  const getFileCategory = (name: string): "image" | "video" | "audio" | "archive" | "code" | "document" | "generic" => {
+    const ext = name.split(".").pop()?.toLowerCase() || "";
+    if (["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"].includes(ext)) return "image";
+    if (["mp4", "mkv", "avi", "mov", "webm", "flv"].includes(ext)) return "video";
+    if (["mp3", "wav", "flac", "ogg", "m4a", "aac"].includes(ext)) return "audio";
+    if (["zip", "tar", "gz", "7z", "rar", "bz2", "xz"].includes(ext)) return "archive";
+    if (["rs", "ts", "tsx", "js", "jsx", "py", "json", "html", "css", "c", "cpp", "go", "java", "sh"].includes(ext)) return "code";
+    if (["pdf", "docx", "doc", "txt", "md", "pptx", "xlsx", "csv", "odt"].includes(ext)) return "document";
+    return "generic";
   };
 
   const handleUnmount = async (remoteName: string) => {
@@ -536,135 +699,470 @@ export default function App() {
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        {/* Sidebar */}
-        <aside className="w-64 bg-[#f8f9fa] dark:bg-[#202124] px-3 py-4 shrink-0 flex flex-col space-y-1 overflow-y-auto transition-colors duration-300">
-          <button
-            onClick={openAddModal}
-            className="gdrive-btn flex items-center space-x-3 px-5 py-3.5 mb-4 bg-white dark:bg-[#2d2e30] hover:shadow-md rounded-2xl shadow-[0_1px_3px_0_rgba(60,64,67,0.3)] text-sm font-medium text-[#3c4043] dark:text-[#e8eaed] transition cursor-pointer w-fit"
-          >
-            <Plus className="w-5 h-5 text-[#1a73e8] dark:text-[#8ab4f8]" />
-            <span>Nova Nuvem</span>
-          </button>
+        {/* Sidebar Dinâmica: Modo Início vs Modo Explorador Google Drive */}
+        <aside className="w-64 bg-[#f8f9fa] dark:bg-[#171b22] px-3 py-4 shrink-0 flex flex-col justify-between overflow-y-auto border-r border-[#e8eaed] dark:border-white/10 transition-colors duration-300">
+          {explorerFor ? (
+            /* Painel Lateral do Explorador estilo Google Drive */
+            <div className="flex flex-col h-full justify-between">
+              <div className="space-y-1">
+                {/* Botão Novo no estilo Google Drive */}
+                <button
+                  onClick={() => setExplorerNewFolder("")}
+                  className="gdrive-btn flex items-center space-x-3 px-5 py-3 mb-4 bg-white dark:bg-[#2d2e30] hover:shadow-md rounded-2xl shadow-[0_1px_3px_0_rgba(60,64,67,0.3)] text-sm font-medium text-[#3c4043] dark:text-[#e8eaed] transition cursor-pointer w-fit"
+                >
+                  <Plus className="w-5 h-5 text-[#1a73e8] dark:text-[#8ab4f8]" />
+                  <span>Novo</span>
+                </button>
 
-          <div className="px-3 py-2 flex items-center space-x-3 rounded-r-full bg-[#e8f0fe] dark:bg-[#3c4142] text-[#1a73e8] dark:text-[#8ab4f8] text-sm font-medium">
-            <Cloud className="w-4.5 h-4.5" />
-            <span>Meu Drive</span>
-          </div>
+                {/* Itens de Navegação estilo Google Drive */}
+                <div className="space-y-0.5 text-xs font-medium">
+                  <button
+                    onClick={() => {
+                      setExplorerActiveCategory("mydrive");
+                      explorerNavigate("");
+                    }}
+                    className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-full transition cursor-pointer text-left ${
+                      explorerActiveCategory === "mydrive"
+                        ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
+                        : "text-[#444746] dark:text-[#c4c7c5] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                    }`}
+                  >
+                    <HardDrive className="w-4.5 h-4.5 shrink-0" />
+                    <span className="truncate">Meu Drive ({explorerFor})</span>
+                  </button>
 
-          <div className="mt-6 px-3">
-            <p className="text-xs font-semibold text-[#5f6368] dark:text-[#9aa0a6] uppercase tracking-wide mb-2">Status do Sistema</p>
-            <div className="space-y-2 text-xs">
-              <div className="flex items-center justify-between">
-                <span className="text-[#5f6368] dark:text-[#9aa0a6]">rclone</span>
-                {status?.rclone_installed ? (
-                  <span className="flex items-center text-[#188038] font-medium">
-                    <CheckCircle2 className="w-3.5 h-3.5 mr-1" /> OK
-                  </span>
-                ) : (
-                  <span className="flex items-center text-[#d93025] font-medium">
-                    <XCircle className="w-3.5 h-3.5 mr-1" /> Ausente
-                  </span>
-                )}
+                  <button
+                    onClick={() => setExplorerActiveCategory("shared")}
+                    className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-full transition cursor-pointer text-left ${
+                      explorerActiveCategory === "shared"
+                        ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
+                        : "text-[#444746] dark:text-[#c4c7c5] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                    }`}
+                  >
+                    <Users className="w-4.5 h-4.5 shrink-0" />
+                    <span>Drives compartilhados</span>
+                  </button>
+
+                  <button
+                    onClick={() => setExplorerActiveCategory("computers")}
+                    className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-full transition cursor-pointer text-left ${
+                      explorerActiveCategory === "computers"
+                        ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
+                        : "text-[#444746] dark:text-[#c4c7c5] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                    }`}
+                  >
+                    <Laptop className="w-4.5 h-4.5 shrink-0" />
+                    <span>Computadores</span>
+                  </button>
+
+                  <div className="pt-2 pb-1">
+                    <div className="h-px bg-[#e8eaed] dark:bg-white/10 mx-2" />
+                  </div>
+
+                  <button
+                    onClick={() => setExplorerActiveCategory("shared_with_me")}
+                    className={`w-full flex items-center space-x-3 px-3.5 py-2 rounded-full transition cursor-pointer text-left ${
+                      explorerActiveCategory === "shared_with_me"
+                        ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
+                        : "text-[#444746] dark:text-[#c4c7c5] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                    }`}
+                  >
+                    <Users className="w-4.5 h-4.5 shrink-0" />
+                    <span>Compartilhados comigo</span>
+                  </button>
+
+                  <button
+                    onClick={() => setExplorerActiveCategory("recent")}
+                    className={`w-full flex items-center space-x-3 px-3.5 py-2 rounded-full transition cursor-pointer text-left ${
+                      explorerActiveCategory === "recent"
+                        ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
+                        : "text-[#444746] dark:text-[#c4c7c5] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                    }`}
+                  >
+                    <Clock className="w-4.5 h-4.5 shrink-0" />
+                    <span>Recentes</span>
+                  </button>
+
+                  <button
+                    onClick={() => setExplorerActiveCategory("starred")}
+                    className={`w-full flex items-center space-x-3 px-3.5 py-2 rounded-full transition cursor-pointer text-left ${
+                      explorerActiveCategory === "starred"
+                        ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
+                        : "text-[#444746] dark:text-[#c4c7c5] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                    }`}
+                  >
+                    <Star className="w-4.5 h-4.5 shrink-0" />
+                    <span>Com estrela</span>
+                  </button>
+
+                  <button
+                    onClick={() => setExplorerActiveCategory("spam")}
+                    className={`w-full flex items-center space-x-3 px-3.5 py-2 rounded-full transition cursor-pointer text-left ${
+                      explorerActiveCategory === "spam"
+                        ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
+                        : "text-[#444746] dark:text-[#c4c7c5] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                    }`}
+                  >
+                    <AlertCircle className="w-4.5 h-4.5 shrink-0" />
+                    <span>Spam</span>
+                  </button>
+
+                  <button
+                    onClick={() => setExplorerActiveCategory("trash")}
+                    className={`w-full flex items-center space-x-3 px-3.5 py-2 rounded-full transition cursor-pointer text-left ${
+                      explorerActiveCategory === "trash"
+                        ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
+                        : "text-[#444746] dark:text-[#c4c7c5] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                    }`}
+                  >
+                    <Trash className="w-4.5 h-4.5 shrink-0" />
+                    <span>Lixeira</span>
+                  </button>
+
+                  <button
+                    onClick={() => setExplorerActiveCategory("storage")}
+                    className={`w-full flex items-center space-x-3 px-3.5 py-2 rounded-full transition cursor-pointer text-left ${
+                      explorerActiveCategory === "storage"
+                        ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
+                        : "text-[#444746] dark:text-[#c4c7c5] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                    }`}
+                  >
+                    <Database className="w-4.5 h-4.5 shrink-0" />
+                    <span>Armazenamento</span>
+                  </button>
+                </div>
               </div>
-              <div className="flex items-center justify-between">
-                <span className="text-[#5f6368] dark:text-[#9aa0a6]">FUSE</span>
-                {status?.fuse_installed ? (
-                  <span className="flex items-center text-[#188038] font-medium">
-                    <CheckCircle2 className="w-3.5 h-3.5 mr-1" /> OK
-                  </span>
+
+              {/* Barra de Armazenamento e Cota no Rodapé da Barra Lateral */}
+              <div className="pt-4 pb-1 border-t border-[#e8eaed] dark:border-white/10 px-2">
+                <div className="flex items-center space-x-2 text-xs font-medium text-[#444746] dark:text-[#c4c7c5] mb-2">
+                  <Cloud className="w-4 h-4 text-[#1a73e8] dark:text-[#8ab4f8]" />
+                  <span>Armazenamento</span>
+                </div>
+
+                {explorerQuota && explorerQuota.total ? (
+                  <div className="space-y-1.5">
+                    {/* Barra de Progresso */}
+                    <div className="w-full h-1.5 bg-[#e8eaed] dark:bg-white/15 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-[#1a73e8] dark:bg-[#8ab4f8] rounded-full transition-all duration-500"
+                        style={{
+                          width: `${Math.min(
+                            100,
+                            Math.round(((explorerQuota.used || 0) / explorerQuota.total) * 100)
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                    <p className="text-[11px] text-[#5f6368] dark:text-[#9aa0a6]">
+                      {formatBytes(explorerQuota.used || 0)} de {formatBytes(explorerQuota.total)} usados
+                    </p>
+                  </div>
                 ) : (
-                  <span className="flex items-center text-[#f9ab00] font-medium">
-                    <AlertTriangle className="w-3.5 h-3.5 mr-1" /> Falta
-                  </span>
+                  <p className="text-[11px] text-[#5f6368] dark:text-[#9aa0a6]">
+                    Calculando cota de disco...
+                  </p>
                 )}
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-[#5f6368] dark:text-[#9aa0a6]">Montados</span>
-                <span className="font-medium text-[#3c4043] dark:text-[#e8eaed]">
-                  {remotes.filter((r) => r.is_mounted).length}/{remotes.length}
-                </span>
+
+                {/* Botão Voltar ao Início */}
+                <button
+                  onClick={() => setExplorerFor(null)}
+                  className="gdrive-btn mt-3 w-full py-1.5 px-3 rounded-full text-xs font-medium text-[#1a73e8] dark:text-[#8ab4f8] hover:bg-[#1a73e8]/10 border border-[#1a73e8]/30 transition cursor-pointer text-center"
+                >
+                  ← Voltar aos Meus Drives
+                </button>
               </div>
             </div>
-          </div>
+          ) : (
+            /* Painel Lateral Padrão do Modo Início */
+            <div>
+              <button
+                onClick={openAddModal}
+                className="gdrive-btn flex items-center space-x-3 px-5 py-3.5 mb-4 bg-white dark:bg-[#2d2e30] hover:shadow-md rounded-2xl shadow-[0_1px_3px_0_rgba(60,64,67,0.3)] text-sm font-medium text-[#3c4043] dark:text-[#e8eaed] transition cursor-pointer w-fit"
+              >
+                <Plus className="w-5 h-5 text-[#1a73e8] dark:text-[#8ab4f8]" />
+                <span>Nova Nuvem</span>
+              </button>
+
+              <div className="px-3 py-2 flex items-center space-x-3 rounded-r-full bg-[#e8f0fe] dark:bg-[#3c4142] text-[#1a73e8] dark:text-[#8ab4f8] text-sm font-medium">
+                <Cloud className="w-4.5 h-4.5" />
+                <span>Meu Drive</span>
+              </div>
+
+              <div className="mt-6 px-3">
+                <p className="text-xs font-semibold text-[#5f6368] dark:text-[#9aa0a6] uppercase tracking-wide mb-2">Status do Sistema</p>
+                <div className="space-y-2 text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#5f6368] dark:text-[#9aa0a6]">rclone</span>
+                    {status?.rclone_installed ? (
+                      <span className="flex items-center text-[#188038] font-medium">
+                        <CheckCircle2 className="w-3.5 h-3.5 mr-1" /> OK
+                      </span>
+                    ) : (
+                      <span className="flex items-center text-[#d93025] font-medium">
+                        <XCircle className="w-3.5 h-3.5 mr-1" /> Ausente
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#5f6368] dark:text-[#9aa0a6]">FUSE</span>
+                    {status?.fuse_installed ? (
+                      <span className="flex items-center text-[#188038] font-medium">
+                        <CheckCircle2 className="w-3.5 h-3.5 mr-1" /> OK
+                      </span>
+                    ) : (
+                      <span className="flex items-center text-[#f9ab00] font-medium">
+                        <AlertTriangle className="w-3.5 h-3.5 mr-1" /> Falta
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#5f6368] dark:text-[#9aa0a6]">Montados</span>
+                    <span className="font-medium text-[#3c4043] dark:text-[#e8eaed]">
+                      {remotes.filter((r) => r.is_mounted).length}/{remotes.length}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </aside>
 
         {/* Main content */}
         <main className={`flex-1 overflow-y-auto ${explorerFor ? "flex flex-col" : "px-8 py-6"}`}>
           {explorerFor ? (
-          <div className="flex-1 flex flex-col min-h-0">
-            <div className="flex items-center justify-between px-6 py-3 border-b border-[#e8eaed] dark:border-white/10 shrink-0">
-              <div className="flex items-center space-x-2 min-w-0">
+          <div className="flex-1 flex flex-col min-h-0 bg-white dark:bg-[#1e232d] transition-colors">
+            {/* Header com Nome do Remote e Estatísticas */}
+            <div className="flex items-center justify-between px-6 py-3.5 border-b border-[#e8eaed] dark:border-white/10 shrink-0 bg-[#f8f9fa] dark:bg-[#171b22]">
+              <div className="flex items-center space-x-3 min-w-0">
                 <button
                   onClick={() => setExplorerFor(null)}
-                  className="gdrive-btn p-1.5 -ml-1.5 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                  className="gdrive-btn p-2 -ml-2 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
                   title="Voltar para os drives"
                 >
                   <ChevronRight className="w-5 h-5 rotate-180" />
                 </button>
-                <FolderTree className="w-5 h-5 text-[#1a73e8] dark:text-[#8ab4f8] shrink-0" />
-                <h1 className="text-[18px] font-medium text-[#202124] dark:text-[#e8eaed] truncate">
-                  Explorador · {explorerFor}
-                </h1>
+                <div className="p-2 rounded-xl bg-[#1a73e8]/10 text-[#1a73e8] dark:text-[#8ab4f8]">
+                  <FolderTree className="w-5 h-5" />
+                </div>
+                <div>
+                  <h1 className="text-base font-semibold text-[#202124] dark:text-[#e8eaed] flex items-center gap-2">
+                    <span>{explorerFor}</span>
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-[#1a73e8]/10 text-[#1a73e8] dark:text-[#8ab4f8] font-normal">
+                      {explorerEntries.length} item(ns)
+                    </span>
+                  </h1>
+                  <p className="text-[11px] text-[#5f6368] dark:text-[#9aa0a6]">
+                    Nuvem remota conectada via Rclone
+                  </p>
+                </div>
+              </div>
+
+              {/* Botão de Atualizar e Fechar rápido */}
+              <div className="flex items-center space-x-1.5">
+                <button
+                  onClick={() => explorerFor && loadExplorer(explorerFor, explorerPath)}
+                  disabled={explorerLoading}
+                  className="gdrive-btn p-2 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                  title="Recarregar pasta"
+                >
+                  <RefreshCw className={`w-4 h-4 ${explorerLoading ? "animate-spin text-[#1a73e8]" : ""}`} />
+                </button>
+                <button
+                  onClick={() => setExplorerFor(null)}
+                  className="gdrive-btn p-2 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                  title="Fechar explorador"
+                >
+                  <X className="w-5 h-5" />
+                </button>
               </div>
             </div>
 
-            {/* Breadcrumbs */}
-            <div className="flex items-center flex-wrap gap-1 px-6 py-2.5 border-b border-[#e8eaed] dark:border-white/10 text-xs shrink-0">
+            {/* Breadcrumbs Interativo com Botão Subir Pasta */}
+            <div className="flex items-center gap-2 px-6 py-2.5 border-b border-[#e8eaed] dark:border-white/10 text-xs shrink-0 bg-white/50 dark:bg-[#1a1f29] backdrop-blur-sm">
               <button
-                onClick={() => explorerNavigate("")}
-                className="gdrive-btn px-2 py-1 rounded-md text-[#1a73e8] dark:text-[#8ab4f8] hover:bg-[#e8f0fe] dark:hover:bg-white/10 cursor-pointer font-medium"
+                onClick={() => {
+                  const segments = explorerBreadcrumbs();
+                  if (segments.length > 0) {
+                    explorerNavigate(segments.slice(0, -1).join("/"));
+                  }
+                }}
+                disabled={!explorerPath}
+                className="gdrive-btn p-1.5 rounded-lg border border-[#e8eaed] dark:border-white/10 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 disabled:opacity-30 disabled:pointer-events-none transition cursor-pointer"
+                title="Subir um nível (pasta anterior)"
               >
-                {explorerFor}
+                <ArrowUp className="w-3.5 h-3.5" />
               </button>
-              {explorerBreadcrumbs().map((segment, idx) => {
-                const path = explorerBreadcrumbs().slice(0, idx + 1).join("/");
-                return (
-                  <div key={path} className="flex items-center gap-1">
-                    <ChevronRight className="w-3.5 h-3.5 text-[#9aa0a6]" />
-                    <button
-                      onClick={() => explorerNavigate(path)}
-                      className="gdrive-btn px-2 py-1 rounded-md text-[#3c4043] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 cursor-pointer"
-                    >
-                      {segment}
-                    </button>
-                  </div>
-                );
-              })}
+
+              <div className="flex items-center flex-wrap gap-1 flex-1 overflow-x-auto py-0.5">
+                <button
+                  onClick={() => explorerNavigate("")}
+                  className={`gdrive-btn px-2.5 py-1 rounded-lg text-xs transition cursor-pointer font-medium ${
+                    !explorerPath
+                      ? "bg-[#1a73e8]/10 text-[#1a73e8] dark:text-[#8ab4f8] font-semibold"
+                      : "text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10"
+                  }`}
+                >
+                  {explorerFor} (raiz)
+                </button>
+                {explorerBreadcrumbs().map((segment, idx) => {
+                  const path = explorerBreadcrumbs().slice(0, idx + 1).join("/");
+                  const isLast = idx === explorerBreadcrumbs().length - 1;
+                  return (
+                    <div key={path} className="flex items-center gap-1">
+                      <ChevronRight className="w-3.5 h-3.5 text-[#9aa0a6] shrink-0" />
+                      <button
+                        onClick={() => explorerNavigate(path)}
+                        className={`gdrive-btn px-2.5 py-1 rounded-lg text-xs transition cursor-pointer ${
+                          isLast
+                            ? "bg-[#1a73e8]/10 text-[#1a73e8] dark:text-[#8ab4f8] font-semibold"
+                            : "text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10"
+                        }`}
+                      >
+                        {segment}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
 
-            {/* Toolbar */}
-            <div className="flex items-center flex-wrap gap-2 px-6 py-2.5 border-b border-[#e8eaed] dark:border-white/10 shrink-0">
+            {/* Barra de Ferramentas, Busca e Filtros */}
+            <div className="flex items-center flex-wrap gap-2.5 px-6 py-2.5 border-b border-[#e8eaed] dark:border-white/10 shrink-0 bg-white dark:bg-[#1e232d]">
+              {/* Campo de Busca Rápida */}
+              <div className="relative flex-1 min-w-[200px] max-w-sm">
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[#9aa0a6]" />
+                <input
+                  type="text"
+                  value={explorerSearch}
+                  onChange={(e) => setExplorerSearch(e.target.value)}
+                  placeholder="Filtrar arquivos nesta pasta..."
+                  className="w-full pl-9 pr-7 py-1.5 text-xs bg-[#f1f3f4] dark:bg-white/5 border border-transparent dark:border-white/10 rounded-full focus:bg-white dark:focus:bg-transparent focus:border-[#1a73e8] dark:focus:border-[#8ab4f8] focus:outline-none transition dark:text-[#e8eaed]"
+                />
+                {explorerSearch && (
+                  <button
+                    onClick={() => setExplorerSearch("")}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#9aa0a6] hover:text-[#5f6368] dark:hover:text-white cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              {/* Botões de Ação Básica */}
               <button
                 onClick={toggleExplorerSelectAll}
-                className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#3c4043] dark:text-[#e8eaed] bg-[#f1f3f4] dark:bg-white/10 hover:bg-[#e8eaed] dark:hover:bg-white/20 rounded-full transition cursor-pointer"
+                className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#3c4043] dark:text-[#e8eaed] bg-[#f1f3f4] dark:bg-white/5 hover:bg-[#e8eaed] dark:hover:bg-white/10 border border-[#e8eaed] dark:border-white/10 rounded-full transition cursor-pointer"
               >
                 {explorerSelected.size > 0 && explorerSelected.size === explorerEntries.length ? (
-                  <CheckSquare className="w-3.5 h-3.5" />
+                  <CheckSquare className="w-3.5 h-3.5 text-[#1a73e8] dark:text-[#8ab4f8]" />
                 ) : (
                   <SquareEmptyIcon className="w-3.5 h-3.5" />
                 )}
-                <span>Selecionar tudo</span>
+                <span>{explorerSelected.size > 0 ? `${explorerSelected.size} marcados` : "Selecionar tudo"}</span>
               </button>
+
               <button
                 onClick={() => setExplorerNewFolder("")}
-                className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#3c4043] dark:text-[#e8eaed] bg-[#f1f3f4] dark:bg-white/10 hover:bg-[#e8eaed] dark:hover:bg-white/20 rounded-full transition cursor-pointer"
+                className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#3c4043] dark:text-[#e8eaed] bg-[#f1f3f4] dark:bg-white/5 hover:bg-[#e8eaed] dark:hover:bg-white/10 border border-[#e8eaed] dark:border-white/10 rounded-full transition cursor-pointer"
               >
-                <FolderPlus className="w-3.5 h-3.5" />
+                <FolderPlus className="w-3.5 h-3.5 text-[#1a73e8] dark:text-[#8ab4f8]" />
                 <span>Nova pasta</span>
               </button>
 
-              <span className="flex-1" />
+              <span className="w-px h-5 bg-[#e8eaed] dark:bg-white/10 mx-1 hidden sm:block" />
 
+              {/* Seletor de Ordenação */}
+              <div className="flex items-center space-x-1 bg-[#f1f3f4] dark:bg-white/5 p-0.5 rounded-full border border-[#e8eaed] dark:border-white/10">
+                <button
+                  onClick={() => {
+                    if (explorerSortField === "name") setExplorerSortOrder((o) => (o === "asc" ? "desc" : "asc"));
+                    else {
+                      setExplorerSortField("name");
+                      setExplorerSortOrder("asc");
+                    }
+                  }}
+                  className={`px-2.5 py-1 text-xs rounded-full transition cursor-pointer ${
+                    explorerSortField === "name"
+                      ? "bg-white dark:bg-white/20 text-[#1a73e8] dark:text-white font-semibold shadow-xs"
+                      : "text-[#5f6368] dark:text-[#9aa0a6] hover:text-[#202124] dark:hover:text-white"
+                  }`}
+                  title="Ordenar por Nome"
+                >
+                  Nome {explorerSortField === "name" && (explorerSortOrder === "asc" ? "↑" : "↓")}
+                </button>
+                <button
+                  onClick={() => {
+                    if (explorerSortField === "size") setExplorerSortOrder((o) => (o === "asc" ? "desc" : "asc"));
+                    else {
+                      setExplorerSortField("size");
+                      setExplorerSortOrder("desc");
+                    }
+                  }}
+                  className={`px-2.5 py-1 text-xs rounded-full transition cursor-pointer ${
+                    explorerSortField === "size"
+                      ? "bg-white dark:bg-white/20 text-[#1a73e8] dark:text-white font-semibold shadow-xs"
+                      : "text-[#5f6368] dark:text-[#9aa0a6] hover:text-[#202124] dark:hover:text-white"
+                  }`}
+                  title="Ordenar por Tamanho"
+                >
+                  Tamanho {explorerSortField === "size" && (explorerSortOrder === "asc" ? "↑" : "↓")}
+                </button>
+                <button
+                  onClick={() => {
+                    if (explorerSortField === "date") setExplorerSortOrder((o) => (o === "asc" ? "desc" : "asc"));
+                    else {
+                      setExplorerSortField("date");
+                      setExplorerSortOrder("desc");
+                    }
+                  }}
+                  className={`px-2.5 py-1 text-xs rounded-full transition cursor-pointer ${
+                    explorerSortField === "date"
+                      ? "bg-white dark:bg-white/20 text-[#1a73e8] dark:text-white font-semibold shadow-xs"
+                      : "text-[#5f6368] dark:text-[#9aa0a6] hover:text-[#202124] dark:hover:text-white"
+                  }`}
+                  title="Ordenar por Data"
+                >
+                  Data {explorerSortField === "date" && (explorerSortOrder === "asc" ? "↑" : "↓")}
+                </button>
+              </div>
+
+              {/* Alternar Visualização: Lista ou Grade */}
+              <div className="flex items-center space-x-0.5 bg-[#f1f3f4] dark:bg-white/5 p-0.5 rounded-full border border-[#e8eaed] dark:border-white/10">
+                <button
+                  onClick={() => setExplorerViewMode("list")}
+                  className={`p-1.5 rounded-full transition cursor-pointer ${
+                    explorerViewMode === "list"
+                      ? "bg-white dark:bg-white/20 text-[#1a73e8] dark:text-white shadow-xs"
+                      : "text-[#5f6368] dark:text-[#9aa0a6]"
+                  }`}
+                  title="Visualização em Lista"
+                >
+                  <List className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  onClick={() => setExplorerViewMode("grid")}
+                  className={`p-1.5 rounded-full transition cursor-pointer ${
+                    explorerViewMode === "grid"
+                      ? "bg-white dark:bg-white/20 text-[#1a73e8] dark:text-white shadow-xs"
+                      : "text-[#5f6368] dark:text-[#9aa0a6]"
+                  }`}
+                  title="Visualização em Grade de Ícones"
+                >
+                  <LayoutGrid className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              {/* Ações em lote para seleção */}
               {explorerSelected.size > 0 && (
-                <>
-                  <span className="text-xs text-[#9aa0a6]">{explorerSelected.size} selecionado(s)</span>
+                <div className="flex items-center space-x-1.5 ml-auto animate-scaleIn">
                   <button
                     onClick={() => {
                       setExplorerTransferMode("copy");
                       setExplorerDestInput(explorerPath);
                     }}
                     disabled={explorerBusy}
-                    className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#1a73e8] bg-[#e8f0fe] hover:bg-[#d2e3fc] rounded-full transition cursor-pointer disabled:opacity-50"
+                    className="gdrive-btn flex items-center space-x-1 px-3 py-1.5 text-xs font-medium text-[#1a73e8] dark:text-[#8ab4f8] bg-[#e8f0fe] dark:bg-[#1a73e8]/20 hover:bg-[#d2e3fc] rounded-full transition cursor-pointer disabled:opacity-50"
                   >
                     <Copy className="w-3.5 h-3.5" />
                     <span>Copiar</span>
@@ -675,7 +1173,7 @@ export default function App() {
                       setExplorerDestInput(explorerPath);
                     }}
                     disabled={explorerBusy}
-                    className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#1a73e8] bg-[#e8f0fe] hover:bg-[#d2e3fc] rounded-full transition cursor-pointer disabled:opacity-50"
+                    className="gdrive-btn flex items-center space-x-1 px-3 py-1.5 text-xs font-medium text-[#1a73e8] dark:text-[#8ab4f8] bg-[#e8f0fe] dark:bg-[#1a73e8]/20 hover:bg-[#d2e3fc] rounded-full transition cursor-pointer disabled:opacity-50"
                   >
                     <Move className="w-3.5 h-3.5" />
                     <span>Mover</span>
@@ -683,26 +1181,27 @@ export default function App() {
                   <button
                     onClick={handleExplorerDelete}
                     disabled={explorerBusy}
-                    className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#d93025] bg-[#fce8e6] hover:bg-[#fad2cf] rounded-full transition cursor-pointer disabled:opacity-50"
+                    className="gdrive-btn flex items-center space-x-1 px-3 py-1.5 text-xs font-medium text-[#d93025] bg-[#fce8e6] dark:bg-[#d93025]/20 hover:bg-[#fad2cf] rounded-full transition cursor-pointer disabled:opacity-50"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                     <span>Deletar</span>
                   </button>
-                </>
+                </div>
               )}
             </div>
 
-            {/* New folder inline input */}
+            {/* Input inline para Nova Pasta */}
             {explorerNewFolder !== null && (
-              <div className="animate-fadeIn flex items-center gap-2 px-6 py-2.5 border-b border-[#e8eaed] dark:border-white/10 bg-[#f8f9fa] dark:bg-[#202124] shrink-0">
+              <div className="animate-fadeIn flex items-center gap-2 px-6 py-2.5 border-b border-[#e8eaed] dark:border-white/10 bg-[#f8f9fa] dark:bg-[#171b22] shrink-0">
+                <FolderPlus className="w-4 h-4 text-[#1a73e8] dark:text-[#8ab4f8]" />
                 <input
                   autoFocus
                   type="text"
                   value={explorerNewFolder}
                   onChange={(e) => setExplorerNewFolder(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && handleExplorerCreateFolder()}
-                  placeholder="Nome da nova pasta"
-                  className="flex-1 px-3 py-1.5 text-sm border border-[#dadce0] dark:border-white/15 dark:bg-transparent dark:text-[#e8eaed] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40"
+                  placeholder="Digite o nome da nova pasta..."
+                  className="flex-1 px-3.5 py-1.5 text-xs border border-[#dadce0] dark:border-white/15 dark:bg-transparent dark:text-[#e8eaed] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40"
                 />
                 <button
                   onClick={handleExplorerCreateFolder}
@@ -720,11 +1219,11 @@ export default function App() {
               </div>
             )}
 
-            {/* Copy/Move destination input */}
+            {/* Input inline para Copiar / Mover */}
             {explorerTransferMode && (
-              <div className="animate-fadeIn flex items-center gap-2 px-6 py-2.5 border-b border-[#e8eaed] dark:border-white/10 bg-[#f8f9fa] dark:bg-[#202124] shrink-0">
-                <span className="text-xs text-[#5f6368] dark:text-[#9aa0a6] shrink-0">
-                  {explorerTransferMode === "copy" ? "Copiar para:" : "Mover para:"}
+              <div className="animate-fadeIn flex items-center gap-2 px-6 py-2.5 border-b border-[#e8eaed] dark:border-white/10 bg-[#e8f0fe]/50 dark:bg-[#171b22] shrink-0">
+                <span className="text-xs font-medium text-[#1a73e8] dark:text-[#8ab4f8] shrink-0">
+                  {explorerTransferMode === "copy" ? "Copiar para pasta:" : "Mover para pasta:"}
                 </span>
                 <input
                   autoFocus
@@ -732,12 +1231,12 @@ export default function App() {
                   value={explorerDestInput}
                   onChange={(e) => setExplorerDestInput(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && handleExplorerTransfer()}
-                  placeholder="caminho/na/nuvem"
-                  className="flex-1 px-3 py-1.5 text-sm border border-[#dadce0] dark:border-white/15 dark:bg-transparent dark:text-[#e8eaed] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40"
+                  placeholder="ex: Fotos/2026 ou deixe vazio para a raiz"
+                  className="flex-1 px-3 py-1.5 text-xs border border-[#dadce0] dark:border-white/15 dark:bg-transparent dark:text-[#e8eaed] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40"
                 />
                 <button
                   onClick={handleExplorerTransfer}
-                  disabled={!explorerDestInput.trim() || explorerBusy}
+                  disabled={explorerBusy}
                   className="gdrive-btn px-4 py-1.5 text-xs font-medium text-white bg-[#1a73e8] hover:bg-[#1765cc] rounded-full transition cursor-pointer disabled:opacity-50"
                 >
                   Confirmar
@@ -751,62 +1250,241 @@ export default function App() {
               </div>
             )}
 
-            {/* File list */}
-            <div className="flex-1 overflow-y-auto">
+            {/* Lista e Grade de Arquivos */}
+            <div className="flex-1 overflow-y-auto p-6">
               {explorerLoading ? (
-                <div className="p-6 space-y-2">
-                  {[1, 2, 3, 4].map((i) => (
-                    <div key={i} className="skeleton h-10 rounded-lg" />
+                <div className="space-y-3">
+                  {[1, 2, 3, 4, 5, 6].map((i) => (
+                    <div key={i} className="skeleton h-12 rounded-xl" />
                   ))}
                 </div>
-              ) : explorerEntries.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-full text-center px-6">
-                  <FolderIcon className="w-10 h-10 text-[#dadce0] mb-2" />
-                  <p className="text-sm text-[#9aa0a6]">Esta pasta está vazia.</p>
-                </div>
-              ) : (
-                <table className="w-full text-sm">
-                  <tbody>
-                    {explorerEntries.map((entry) => {
-                      const selected = explorerSelected.has(entry.Name);
-                      return (
-                        <tr
-                          key={entry.Name}
-                          onClick={() => toggleExplorerSelect(entry.Name)}
-                          onDoubleClick={() => entry.IsDir && explorerNavigate(explorerJoin(explorerPath, entry.Name))}
-                          className={`cursor-pointer border-b border-[#f1f3f4] dark:border-white/5 hover:bg-[#f8f9fa] dark:hover:bg-white/5 transition ${
-                            selected ? "bg-[#e8f0fe] dark:bg-[#3c4142]" : ""
-                          }`}
-                        >
-                          <td className="pl-6 py-2.5 w-8">
-                            {selected ? (
-                              <CheckSquare className="w-4 h-4 text-[#1a73e8] dark:text-[#8ab4f8]" />
-                            ) : (
-                              <SquareEmptyIcon className="w-4 h-4 text-[#dadce0]" />
+              ) : (() => {
+                // Filtragem e Ordenação
+                let filtered = explorerEntries.filter((e) =>
+                  e.Name.toLowerCase().includes(explorerSearch.trim().toLowerCase())
+                );
+                filtered.sort((a, b) => {
+                  if (a.IsDir !== b.IsDir) return a.IsDir ? -1 : 1;
+                  let cmp = 0;
+                  if (explorerSortField === "name") cmp = a.Name.localeCompare(b.Name);
+                  else if (explorerSortField === "size") cmp = (a.Size || 0) - (b.Size || 0);
+                  else if (explorerSortField === "date") cmp = (a.ModTime || "").localeCompare(b.ModTime || "");
+                  return explorerSortOrder === "asc" ? cmp : -cmp;
+                });
+
+                if (filtered.length === 0) {
+                  return (
+                    <div className="flex flex-col items-center justify-center h-full text-center py-16">
+                      <FolderIcon className="w-12 h-12 text-[#dadce0] dark:text-white/10 mb-3" />
+                      <p className="text-sm font-medium text-[#5f6368] dark:text-[#9aa0a6]">
+                        {explorerSearch ? `Nenhum arquivo correspondente a "${explorerSearch}"` : "Esta pasta está vazia."}
+                      </p>
+                    </div>
+                  );
+                }
+
+                // Renderização em Grade
+                if (explorerViewMode === "grid") {
+                  return (
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3.5">
+                      {filtered.map((entry, entryIdx) => {
+                        const selected = explorerSelected.has(entry.Name);
+                        const category = getFileCategory(entry.Name);
+                        return (
+                          <div
+                            key={`${entry.Name}-${entryIdx}`}
+                            onClick={() => toggleExplorerSelect(entry.Name)}
+                            onDoubleClick={() => entry.IsDir && explorerNavigate(explorerJoin(explorerPath, entry.Name))}
+                            className={`group relative p-3.5 rounded-2xl border transition-all cursor-pointer flex flex-col items-center text-center ${
+                              selected
+                                ? "bg-[#e8f0fe] dark:bg-[#1a73e8]/20 border-[#1a73e8] dark:border-[#8ab4f8] shadow-sm"
+                                : "bg-white dark:bg-white/5 border-[#e8eaed] dark:border-white/10 hover:border-[#1a73e8]/50 hover:shadow-md"
+                            }`}
+                          >
+                            {/* Checkbox no topo */}
+                            <div className="absolute top-2 left-2 opacity-0 group-hover:opacity-100 transition-opacity" style={{ opacity: selected ? 1 : undefined }}>
+                              {selected ? (
+                                <CheckSquare className="w-4 h-4 text-[#1a73e8] dark:text-[#8ab4f8]" />
+                              ) : (
+                                <SquareEmptyIcon className="w-4 h-4 text-[#9aa0a6]" />
+                              )}
+                            </div>
+
+                            {/* Ícone */}
+                            <div className="w-12 h-12 my-2 rounded-2xl flex items-center justify-center bg-[#f1f3f4] dark:bg-white/10 text-[#5f6368] dark:text-[#e8eaed] group-hover:scale-105 transition-transform">
+                              {entry.IsDir ? (
+                                <FolderIcon className="w-7 h-7 text-[#1a73e8] dark:text-[#8ab4f8] fill-[#1a73e8]/20" />
+                              ) : category === "image" ? (
+                                <ImageIcon className="w-6 h-6 text-emerald-500" />
+                              ) : category === "video" ? (
+                                <VideoIcon className="w-6 h-6 text-purple-500" />
+                              ) : category === "audio" ? (
+                                <MusicIcon className="w-6 h-6 text-amber-500" />
+                              ) : category === "code" ? (
+                                <CodeIcon className="w-6 h-6 text-blue-500" />
+                              ) : category === "archive" ? (
+                                <Archive className="w-6 h-6 text-orange-500" />
+                              ) : (
+                                <FileText className="w-6 h-6 text-[#9aa0a6]" />
+                              )}
+                            </div>
+
+                            {/* Nome e Tamanho */}
+                            <span className="w-full text-xs font-medium text-[#202124] dark:text-[#e8eaed] truncate mb-0.5">
+                              {entry.Name}
+                            </span>
+                            <span className="text-[11px] text-[#9aa0a6]">
+                              {entry.IsDir ? "Pasta" : formatBytes(entry.Size)}
+                            </span>
+
+                            {/* Ações rápidas ao passar o mouse */}
+                            {!entry.IsDir && (
+                              <div className="mt-2 pt-2 border-t border-[#e8eaed]/50 dark:border-white/5 w-full flex items-center justify-center space-x-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleExplorerPreview(entry.Name);
+                                  }}
+                                  className="p-1 rounded-full text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                                  title="Prévia"
+                                >
+                                  <Eye className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleExplorerDownload(entry.Name);
+                                  }}
+                                  className="p-1 rounded-full text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                                  title="Baixar para Downloads"
+                                >
+                                  <Download className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleExplorerShareLink(entry.Name);
+                                  }}
+                                  className="p-1 rounded-full text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10"
+                                  title="Copiar Link"
+                                >
+                                  <Link2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
                             )}
-                          </td>
-                          <td className="py-2.5 w-8">
-                            {entry.IsDir ? (
-                              <FolderIcon className="w-4 h-4 text-[#1a73e8] dark:text-[#8ab4f8]" />
-                            ) : (
-                              <FileIcon className="w-4 h-4 text-[#9aa0a6]" />
-                            )}
-                          </td>
-                          <td className="py-2.5 pr-3 text-[#202124] dark:text-[#e8eaed] truncate max-w-[1px] w-full">
-                            {entry.Name}
-                          </td>
-                          <td className="py-2.5 pr-3 text-[#9aa0a6] whitespace-nowrap text-xs">
-                            {entry.IsDir ? "—" : formatBytes(entry.Size)}
-                          </td>
-                          <td className="py-2.5 pr-6 text-[#9aa0a6] whitespace-nowrap text-xs">
-                            {entry.ModTime ? new Date(entry.ModTime).toLocaleDateString() : ""}
-                          </td>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                }
+
+                // Renderização em Lista
+                return (
+                  <div className="overflow-hidden rounded-2xl border border-[#e8eaed] dark:border-white/10 bg-white dark:bg-white/5 shadow-xs">
+                    <table className="w-full text-left text-xs">
+                      <thead>
+                        <tr className="border-b border-[#e8eaed] dark:border-white/10 bg-[#f8f9fa] dark:bg-white/5 text-[#5f6368] dark:text-[#9aa0a6] font-medium">
+                          <th className="pl-4 py-3 w-10"></th>
+                          <th className="py-3 w-10"></th>
+                          <th className="py-3">Nome</th>
+                          <th className="py-3 w-28">Tamanho</th>
+                          <th className="py-3 w-36">Modificado</th>
+                          <th className="pr-4 py-3 w-32 text-right">Ações</th>
                         </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              )}
+                      </thead>
+                      <tbody className="divide-y divide-[#e8eaed]/60 dark:divide-white/5">
+                        {filtered.map((entry, entryIdx) => {
+                          const selected = explorerSelected.has(entry.Name);
+                          const category = getFileCategory(entry.Name);
+                          return (
+                            <tr
+                              key={`${entry.Name}-${entryIdx}`}
+                              onClick={() => toggleExplorerSelect(entry.Name)}
+                              onDoubleClick={() => entry.IsDir && explorerNavigate(explorerJoin(explorerPath, entry.Name))}
+                              className={`group cursor-pointer transition-colors ${
+                                selected
+                                  ? "bg-[#e8f0fe] dark:bg-[#1a73e8]/20"
+                                  : "hover:bg-[#f8f9fa] dark:hover:bg-white/5"
+                              }`}
+                            >
+                              <td className="pl-4 py-3">
+                                {selected ? (
+                                  <CheckSquare className="w-4 h-4 text-[#1a73e8] dark:text-[#8ab4f8]" />
+                                ) : (
+                                  <SquareEmptyIcon className="w-4 h-4 text-[#dadce0] dark:text-white/20 group-hover:text-[#9aa0a6]" />
+                                )}
+                              </td>
+                              <td className="py-3">
+                                {entry.IsDir ? (
+                                  <FolderIcon className="w-4.5 h-4.5 text-[#1a73e8] dark:text-[#8ab4f8] fill-[#1a73e8]/20" />
+                                ) : category === "image" ? (
+                                  <ImageIcon className="w-4 h-4 text-emerald-500" />
+                                ) : category === "video" ? (
+                                  <VideoIcon className="w-4 h-4 text-purple-500" />
+                                ) : category === "audio" ? (
+                                  <MusicIcon className="w-4 h-4 text-amber-500" />
+                                ) : category === "code" ? (
+                                  <CodeIcon className="w-4 h-4 text-blue-500" />
+                                ) : category === "archive" ? (
+                                  <Archive className="w-4 h-4 text-orange-500" />
+                                ) : (
+                                  <FileText className="w-4 h-4 text-[#9aa0a6]" />
+                                )}
+                              </td>
+                              <td className="py-3 pr-4 font-medium text-[#202124] dark:text-[#e8eaed]">
+                                <span className="hover:underline">{entry.Name}</span>
+                              </td>
+                              <td className="py-3 text-[#5f6368] dark:text-[#9aa0a6]">
+                                {entry.IsDir ? "—" : formatBytes(entry.Size)}
+                              </td>
+                              <td className="py-3 text-[#5f6368] dark:text-[#9aa0a6]">
+                                {entry.ModTime ? new Date(entry.ModTime).toLocaleDateString() : "—"}
+                              </td>
+                              <td className="pr-4 py-3 text-right">
+                                {!entry.IsDir && (
+                                  <div className="flex items-center justify-end space-x-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleExplorerPreview(entry.Name);
+                                      }}
+                                      className="p-1 text-[#5f6368] dark:text-[#e8eaed] hover:text-[#1a73e8] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                                      title="Prévia"
+                                    >
+                                      <Eye className="w-3.5 h-3.5" />
+                                    </button>
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleExplorerDownload(entry.Name);
+                                      }}
+                                      className="p-1 text-[#5f6368] dark:text-[#e8eaed] hover:text-[#1a73e8] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                                      title="Baixar para pasta Downloads"
+                                    >
+                                      <Download className="w-3.5 h-3.5" />
+                                    </button>
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleExplorerShareLink(entry.Name);
+                                      }}
+                                      className="p-1 text-[#5f6368] dark:text-[#e8eaed] hover:text-[#1a73e8] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                                      title="Gerar link de compartilhamento"
+                                    >
+                                      <Link2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                );
+              })()}
             </div>
           </div>
           ) : (
@@ -1318,6 +1996,79 @@ export default function App() {
               >
                 Concluído
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal de Prévia Rápida de Arquivo */}
+      {explorerPreview && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/60 animate-fadeIn backdrop-blur-xs" onClick={() => setExplorerPreview(null)} />
+          <div className="relative animate-scaleIn bg-white dark:bg-[#1e232d] rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] overflow-hidden flex flex-col border border-[#e8eaed] dark:border-white/10">
+            {/* Cabeçalho da Prévia */}
+            <div className="flex items-center justify-between px-6 py-4 border-b border-[#e8eaed] dark:border-white/10 bg-[#f8f9fa] dark:bg-[#171b22] shrink-0">
+              <div className="flex items-center space-x-2.5 min-w-0">
+                <div className="p-2 rounded-xl bg-[#1a73e8]/10 text-[#1a73e8] dark:text-[#8ab4f8]">
+                  <FileText className="w-5 h-5" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-sm font-semibold text-[#202124] dark:text-[#e8eaed] truncate">
+                    {explorerPreview.name}
+                  </h3>
+                  <p className="text-[11px] text-[#5f6368] dark:text-[#9aa0a6] truncate">
+                    {explorerPreview.path} {explorerPreview.size > 0 && `• ${formatBytes(explorerPreview.size)}`}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center space-x-2">
+                <button
+                  onClick={() => handleExplorerDownload(explorerPreview.name)}
+                  className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-white bg-[#1a73e8] hover:bg-[#1765cc] rounded-full transition cursor-pointer shadow-xs"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Baixar</span>
+                </button>
+                <button
+                  onClick={() => setExplorerPreview(null)}
+                  className="gdrive-btn p-1.5 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#e8eaed] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Conteúdo da Prévia */}
+            <div className="flex-1 overflow-auto p-6 bg-white dark:bg-[#151921] font-mono text-xs text-[#202124] dark:text-[#e8eaed]">
+              {explorerPreview.loading ? (
+                <div className="flex flex-col items-center justify-center py-20 space-y-3">
+                  <Loader2 className="w-8 h-8 animate-spin text-[#1a73e8]" />
+                  <p className="text-xs text-[#5f6368] dark:text-[#9aa0a6]">Carregando conteúdo da nuvem...</p>
+                </div>
+              ) : explorerPreview.is_text && explorerPreview.content !== null ? (
+                <pre className="whitespace-pre-wrap break-words leading-relaxed select-text font-mono bg-[#f8f9fa] dark:bg-[#0d1117] p-4 rounded-xl border border-[#e8eaed] dark:border-white/10">
+                  {explorerPreview.content}
+                </pre>
+              ) : (
+                <div className="flex flex-col items-center justify-center py-16 text-center space-y-3">
+                  <FileIcon className="w-12 h-12 text-[#9aa0a6]" />
+                  <div>
+                    <p className="text-sm font-semibold text-[#202124] dark:text-[#e8eaed]">
+                      Prévia de texto indisponível para este tipo de arquivo
+                    </p>
+                    <p className="text-xs text-[#5f6368] dark:text-[#9aa0a6] mt-1 max-w-sm">
+                      Arquivos binários, vídeos ou mídias complexas podem ser baixados diretamente para a sua pasta Downloads ou abertos através do disco montado.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => handleExplorerDownload(explorerPreview.name)}
+                    className="gdrive-btn mt-2 flex items-center space-x-1.5 px-4 py-2 text-xs font-medium text-white bg-[#1a73e8] hover:bg-[#1765cc] rounded-full transition cursor-pointer"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>Baixar Arquivo Completo</span>
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>

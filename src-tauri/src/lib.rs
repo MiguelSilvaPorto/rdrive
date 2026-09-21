@@ -2,7 +2,10 @@ mod explorer;
 mod rclone;
 mod transfers;
 
-use explorer::{create_cloud_folder, delete_cloud_paths, list_cloud_files, transfer_cloud_path};
+use explorer::{
+    create_cloud_folder, create_share_link, delete_cloud_paths, download_cloud_file,
+    list_cloud_files, preview_cloud_file, transfer_cloud_path,
+};
 use rclone::{
     check_system_environment, create_remote_oauth, delete_remote, get_remote_about,
     install_rclone, list_oauth_providers, list_remotes, mount_remote, unmount_remote, AppState,
@@ -19,6 +22,7 @@ use transfers::{
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState::default())
         .manage(TransferState {
             jobs: std::sync::Mutex::new(load_persisted_jobs()),
@@ -42,6 +46,9 @@ pub fn run() {
             delete_cloud_paths,
             transfer_cloud_path,
             create_cloud_folder,
+            create_share_link,
+            download_cloud_file,
+            preview_cloud_file,
         ])
         .setup(|app| {
             let show_item = MenuItem::with_id(app, "show", "Mostrar Rdrive", true, None::<&str>)?;

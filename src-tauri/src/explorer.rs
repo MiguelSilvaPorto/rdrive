@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudEntry {
@@ -13,10 +12,11 @@ pub struct CloudEntry {
     pub mod_time: String,
 }
 
-fn run_rclone(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("rclone")
+async fn run_rclone(args: &[&str]) -> Result<String, String> {
+    let output = tokio::process::Command::new("rclone")
         .args(args)
         .output()
+        .await
         .map_err(|e| format!("Falha ao executar rclone: {e}"))?;
 
     if !output.status.success() {
@@ -29,9 +29,9 @@ fn run_rclone(args: &[&str]) -> Result<String, String> {
 
 /// Lists the contents of a cloud folder (non-recursive)
 #[tauri::command]
-pub fn list_cloud_files(remote: String, path: String) -> Result<Vec<CloudEntry>, String> {
+pub async fn list_cloud_files(remote: String, path: String) -> Result<Vec<CloudEntry>, String> {
     let target = format!("{}:{}", remote, path.trim_start_matches('/'));
-    let out = run_rclone(&["lsjson", &target])?;
+    let out = run_rclone(&["lsjson", &target]).await?;
     let mut entries: Vec<CloudEntry> =
         serde_json::from_str(&out).map_err(|e| format!("Falha ao interpretar listagem: {e}"))?;
     entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
@@ -40,14 +40,14 @@ pub fn list_cloud_files(remote: String, path: String) -> Result<Vec<CloudEntry>,
 
 /// Deletes one or more files/folders (folders are removed recursively)
 #[tauri::command]
-pub fn delete_cloud_paths(remote: String, paths: Vec<String>, is_dir: Vec<bool>) -> Result<String, String> {
+pub async fn delete_cloud_paths(remote: String, paths: Vec<String>, is_dir: Vec<bool>) -> Result<String, String> {
     let mut errors = Vec::new();
     for (path, dir) in paths.iter().zip(is_dir.iter()) {
         let target = format!("{}:{}", remote, path.trim_start_matches('/'));
         let result = if *dir {
-            run_rclone(&["purge", &target])
+            run_rclone(&["purge", &target]).await
         } else {
-            run_rclone(&["deletefile", &target])
+            run_rclone(&["deletefile", &target]).await
         };
         if let Err(e) = result {
             errors.push(format!("{path}: {e}"));
@@ -63,7 +63,7 @@ pub fn delete_cloud_paths(remote: String, paths: Vec<String>, is_dir: Vec<bool>)
 
 /// Copies or moves a file/folder to a new destination path within the same remote
 #[tauri::command]
-pub fn transfer_cloud_path(
+pub async fn transfer_cloud_path(
     remote: String,
     source: String,
     destination: String,
@@ -77,15 +77,97 @@ pub fn transfer_cloud_path(
     let verb_dir = if move_instead_of_copy { "move" } else { "copy" };
     let verb = if is_dir { verb_dir } else { verb_file };
 
-    run_rclone(&[verb, &src, &dst])?;
+    run_rclone(&[verb, &src, &dst]).await?;
     let action = if move_instead_of_copy { "movido(s)" } else { "copiado(s)" };
     Ok(format!("Item {action} com sucesso."))
 }
 
 /// Creates a new folder inside the given cloud path
 #[tauri::command]
-pub fn create_cloud_folder(remote: String, path: String) -> Result<String, String> {
+pub async fn create_cloud_folder(remote: String, path: String) -> Result<String, String> {
     let target = format!("{}:{}", remote, path.trim_start_matches('/'));
-    run_rclone(&["mkdir", &target])?;
+    run_rclone(&["mkdir", &target]).await?;
     Ok("Pasta criada com sucesso.".to_string())
+}
+
+/// Generates a public share link for a file/folder (only works for providers
+/// that support it, e.g. Drive, Dropbox, OneDrive, Box)
+#[tauri::command]
+pub async fn create_share_link(remote: String, path: String) -> Result<String, String> {
+    let target = format!("{}:{}", remote, path.trim_start_matches('/'));
+    let out = run_rclone(&["link", &target]).await?;
+    Ok(out.trim().to_string())
+}
+
+/// Downloads a single file from cloud to local user Downloads folder
+#[tauri::command]
+pub async fn download_cloud_file(remote: String, path: String) -> Result<String, String> {
+    let dest_dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir);
+
+    let target = format!("{}:{}", remote, path.trim_start_matches('/'));
+    let dest = dest_dir.to_string_lossy().to_string();
+
+    let output = tokio::process::Command::new("rclone")
+        .arg("copyto")
+        .arg(&target)
+        .arg(format!("{}/{}", dest, path.split('/').last().unwrap_or("arquivo")))
+        .output()
+        .await
+        .map_err(|e| format!("Falha ao baixar: {e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Erro ao baixar: {}", err.trim()));
+    }
+
+    Ok(format!("Arquivo salvo em {}", dest))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilePreview {
+    pub name: String,
+    pub is_text: bool,
+    pub content: Option<String>,
+    pub size: i64,
+}
+
+/// Reads small text files (< 512KB) from cloud to preview directly in the UI
+#[tauri::command]
+pub async fn preview_cloud_file(remote: String, path: String) -> Result<FilePreview, String> {
+    let target = format!("{}:{}", remote, path.trim_start_matches('/'));
+    let name = path.split('/').last().unwrap_or("arquivo").to_string();
+
+    // Fetch cat limited to 512KB
+    let output = tokio::process::Command::new("rclone")
+        .arg("cat")
+        .arg("--head")
+        .arg("262144") // 256 KB max preview
+        .arg(&target)
+        .output()
+        .await
+        .map_err(|e| format!("Falha ao ler arquivo: {e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Erro ao ler arquivo: {}", err.trim()));
+    }
+
+    let is_text = match std::str::from_utf8(&output.stdout) {
+        Ok(text) => return Ok(FilePreview {
+            name,
+            is_text: true,
+            content: Some(text.to_string()),
+            size: output.stdout.len() as i64,
+        }),
+        Err(_) => false,
+    };
+
+    Ok(FilePreview {
+        name,
+        is_text,
+        content: None,
+        size: output.stdout.len() as i64,
+    })
 }

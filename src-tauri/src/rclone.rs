@@ -31,12 +31,13 @@ pub struct AppState {
 
 /// Detects if rclone and fuse (fusermount) are installed
 #[tauri::command]
-pub fn check_system_environment() -> SystemStatus {
-    let rclone_check = Command::new("rclone")
+pub async fn check_system_environment() -> SystemStatus {
+    let rclone_check = tokio::process::Command::new("rclone")
         .arg("version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output();
+        .output()
+        .await;
 
     let (rclone_installed, rclone_version) = match rclone_check {
         Ok(output) if output.status.success() => {
@@ -47,10 +48,10 @@ pub fn check_system_environment() -> SystemStatus {
         _ => (false, None),
     };
 
-    let fuse_check = Command::new("which")
-        .arg("fusermount3")
-        .output()
-        .or_else(|_| Command::new("which").arg("fusermount").output());
+    let fuse_check = match tokio::process::Command::new("which").arg("fusermount3").output().await {
+        Ok(output) => Ok(output),
+        Err(_) => tokio::process::Command::new("which").arg("fusermount").output().await,
+    };
 
     let fuse_installed = match fuse_check {
         Ok(output) => output.status.success(),
@@ -58,6 +59,7 @@ pub fn check_system_environment() -> SystemStatus {
     };
 
     let config_path = get_rclone_config_path()
+        .await
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "Unknown".to_string());
 
@@ -70,8 +72,8 @@ pub fn check_system_environment() -> SystemStatus {
 }
 
 /// Retrieves path of rclone configuration file
-fn get_rclone_config_path() -> Option<PathBuf> {
-    if let Ok(output) = Command::new("rclone").arg("config").arg("file").output() {
+async fn get_rclone_config_path() -> Option<PathBuf> {
+    if let Ok(output) = tokio::process::Command::new("rclone").arg("config").arg("file").output().await {
         if output.status.success() {
             let out = String::from_utf8_lossy(&output.stdout);
             for line in out.lines() {
@@ -88,11 +90,12 @@ fn get_rclone_config_path() -> Option<PathBuf> {
 
 /// Returns list of remotes configured in rclone.conf along with their mount state
 #[tauri::command]
-pub fn list_remotes(state: State<'_, AppState>) -> Result<Vec<RemoteDrive>, String> {
-    let output = Command::new("rclone")
+pub async fn list_remotes(state: State<'_, AppState>) -> Result<Vec<RemoteDrive>, String> {
+    let output = tokio::process::Command::new("rclone")
         .arg("listremotes")
         .arg("--long")
         .output()
+        .await
         .map_err(|e| format!("Falha ao executar rclone: {e}. Verifique se o rclone está instalado."))?;
 
     if !output.status.success() {
@@ -153,6 +156,7 @@ pub async fn mount_remote(
     read_only: Option<bool>,
     vfs_cache_max_size_gb: Option<f64>,
     cache_dir: Option<String>,
+    bwlimit_mbps: Option<f64>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let mount_dir = match custom_mount_point {
@@ -206,7 +210,9 @@ pub async fn mount_remote(
         .arg("--attr-timeout")
         .arg("1h")
         .arg("--vfs-cache-poll-interval")
-        .arg("30s");
+        .arg("30s")
+        .arg("--vfs-fast-fingerprint")
+        .arg("--no-checksum");
 
     if read_only.unwrap_or(false) {
         cmd.arg("--read-only");
@@ -222,6 +228,12 @@ pub async fn mount_remote(
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("Não foi possível criar a pasta de cache '{dir}': {e}"))?;
         cmd.arg("--cache-dir").arg(&dir);
+    }
+
+    if let Some(mbps) = bwlimit_mbps {
+        if mbps > 0.0 {
+            cmd.arg("--bwlimit").arg(format!("{mbps}M"));
+        }
     }
 
     let child = cmd
