@@ -595,6 +595,7 @@ export default function App() {
   const explorerUnlisten = useRef<UnlistenFn[]>([]);
   const explorerBuffer = useRef<CloudEntry[]>([]);
   const explorerFlushScheduled = useRef(false);
+  const [explorerDebugLog, setExplorerDebugLog] = useState<string[]>([]);
 
   const loadExplorer = async (remote: string, path: string, categoryOverride?: string) => {
     // Cancel any listeners from a previous, still-streaming navigation so its
@@ -607,7 +608,15 @@ export default function App() {
     setExplorerLoading(true);
     setExplorerEntries([]);
     setExplorerSelected(new Set());
+    setExplorerDebugLog([]);
     const cat = categoryOverride !== undefined ? categoryOverride : explorerActiveCategory;
+
+    const t0 = performance.now();
+    const log = (msg: string) => {
+      const line = `+${((performance.now() - t0) / 1000).toFixed(2)}s ${msg}`;
+      setExplorerDebugLog((prev) => [...prev.slice(-30), line]);
+    };
+    log(`invoke list_cloud_files_stream (${cat})`);
 
     const flush = () => {
       if (explorerRequestId.current !== Number(requestId)) return;
@@ -624,18 +633,25 @@ export default function App() {
     try {
       const unEntry = await listen<CloudEntry>(`explorer-entry-${requestId}`, (event) => {
         if (explorerRequestId.current !== Number(requestId)) return;
+        if (explorerBuffer.current.length < 3 || explorerBuffer.current.length % 20 === 0) {
+          log(`entry event #${explorerBuffer.current.length + 1}: ${event.payload.Name}`);
+        }
         explorerBuffer.current.push(event.payload);
         scheduleFlush();
       });
-      const unDone = await listen<number>(`explorer-done-${requestId}`, () => {
+      const unDone = await listen<number>(`explorer-done-${requestId}`, (event) => {
         if (explorerRequestId.current !== Number(requestId)) return;
+        log(`done event, total=${event.payload}`);
         flush();
         setExplorerLoading(false);
       });
       explorerUnlisten.current = [unEntry, unDone];
 
+      log("listeners registered, calling invoke...");
       await invoke<number>("list_cloud_files_stream", { requestId, remote, path, category: cat });
+      log("invoke() promise resolved");
     } catch (err: any) {
+      log(`error: ${err}`);
       if (explorerRequestId.current === Number(requestId)) {
         setMessage({ type: "error", text: String(err) });
         setExplorerLoading(false);
@@ -1682,6 +1698,13 @@ export default function App() {
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
                     <span>Consultando a nuvem...</span>
                   </div>
+                  {explorerDebugLog.length > 0 && (
+                    <div className="font-mono text-[10px] text-[#9aa0a6] bg-black/20 dark:bg-black/30 rounded-lg p-2.5 max-h-40 overflow-y-auto space-y-0.5">
+                      {explorerDebugLog.map((line, i) => (
+                        <div key={i}>{line}</div>
+                      ))}
+                    </div>
+                  )}
                   {[1, 2, 3, 4, 5, 6].map((i) => (
                     <div key={i} className="skeleton h-12 rounded-xl" style={{ animationDelay: `${i * 60}ms` }} />
                   ))}
