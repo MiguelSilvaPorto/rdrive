@@ -1,8 +1,8 @@
 mod rclone;
 
 use rclone::{
-    check_system_environment, create_remote_oauth, delete_remote, list_oauth_providers,
-    list_remotes, mount_remote, unmount_remote, AppState,
+    check_system_environment, create_remote_oauth, delete_remote, install_rclone,
+    list_oauth_providers, list_remotes, mount_remote, unmount_remote, AppState,
 };
 use tauri::Manager;
 
@@ -19,6 +19,7 @@ pub fn run() {
             list_oauth_providers,
             create_remote_oauth,
             delete_remote,
+            install_rclone,
         ])
         .build(tauri::generate_context!())
         .expect("erro ao inicializar aplicação Rdrive")

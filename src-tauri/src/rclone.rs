@@ -358,6 +358,46 @@ pub fn delete_remote(remote: String, state: State<'_, AppState>) -> Result<Strin
     Ok(format!("Remote '{remote}' removido."))
 }
 
+/// Downloads and runs the official rclone install script (https://rclone.org/install.sh),
+/// elevating privileges via pkexec so the user gets a native password prompt.
+#[tauri::command]
+pub async fn install_rclone() -> Result<String, String> {
+    let script = tokio::process::Command::new("curl")
+        .arg("-fsSL")
+        .arg("https://rclone.org/install.sh")
+        .output()
+        .await
+        .map_err(|e| format!("Falha ao baixar o instalador: {e}"))?;
+
+    if !script.status.success() {
+        let err = String::from_utf8_lossy(&script.stderr);
+        return Err(format!("Falha ao baixar o instalador: {}", err.trim()));
+    }
+
+    let script_path = std::env::temp_dir().join("rclone-install.sh");
+    std::fs::write(&script_path, &script.stdout)
+        .map_err(|e| format!("Falha ao salvar o instalador: {e}"))?;
+
+    let output = tokio::process::Command::new("pkexec")
+        .arg("bash")
+        .arg(&script_path)
+        .output()
+        .await
+        .map_err(|e| format!("Falha ao executar o instalador com privilégios elevados: {e}. Instale o pkexec (polkit) ou instale manualmente."))?;
+
+    let _ = std::fs::remove_file(&script_path);
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        if err.contains("Request dismissed") || err.contains("Not authorized") {
+            return Err("Instalação cancelada: autorização de administrador negada.".to_string());
+        }
+        return Err(format!("Falha ao instalar o rclone: {}", err.trim()));
+    }
+
+    Ok("rclone instalado com sucesso.".to_string())
+}
+
 /// Helper to unmount all active drives before exiting
 pub fn unmount_all(state: &AppState) {
     let mut mounted = state.mounted_remotes.lock().unwrap();
