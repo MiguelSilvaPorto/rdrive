@@ -137,6 +137,7 @@ interface CloudProvider {
 
 interface CloudEntry {
   Name: string;
+  Path: string;
   Size: number;
   IsDir: boolean;
   ModTime: string;
@@ -473,6 +474,10 @@ export default function App() {
   const handleSelectCategory = (cat: string) => {
     setExplorerActiveCategory(cat);
     setExplorerPath("");
+    if (cat === "recent") {
+      setExplorerSortField("date");
+      setExplorerSortOrder("desc");
+    }
     if (explorerFor) {
       loadExplorer(explorerFor, "", cat);
     }
@@ -1201,13 +1206,15 @@ export default function App() {
                 <span>{explorerSelected.size > 0 ? `${explorerSelected.size} marcados` : "Selecionar tudo"}</span>
               </button>
 
-              <button
-                onClick={() => setExplorerNewFolder("")}
-                className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#3c4043] dark:text-[#e8eaed] bg-[#f1f3f4] dark:bg-white/5 hover:bg-[#e8eaed] dark:hover:bg-white/10 border border-[#e8eaed] dark:border-white/10 rounded-full transition cursor-pointer"
-              >
-                <FolderPlus className="w-3.5 h-3.5 text-[#1a73e8] dark:text-[#8ab4f8]" />
-                <span>Nova pasta</span>
-              </button>
+              {explorerActiveCategory !== "trash" && (
+                <button
+                  onClick={() => setExplorerNewFolder("")}
+                  className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#3c4043] dark:text-[#e8eaed] bg-[#f1f3f4] dark:bg-white/5 hover:bg-[#e8eaed] dark:hover:bg-white/10 border border-[#e8eaed] dark:border-white/10 rounded-full transition cursor-pointer"
+                >
+                  <FolderPlus className="w-3.5 h-3.5 text-[#1a73e8] dark:text-[#8ab4f8]" />
+                  <span>Nova pasta</span>
+                </button>
+              )}
 
               <span className="w-px h-5 bg-[#e8eaed] dark:bg-white/10 mx-1 hidden sm:block" />
 
@@ -1330,14 +1337,16 @@ export default function App() {
                       </button>
                     </>
                   )}
-                  <button
-                    onClick={handleExplorerDelete}
-                    disabled={explorerBusy}
-                    className="gdrive-btn flex items-center space-x-1 px-3 py-1.5 text-xs font-medium text-[#d93025] bg-[#fce8e6] dark:bg-[#d93025]/20 hover:bg-[#fad2cf] rounded-full transition cursor-pointer disabled:opacity-50"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    <span>Deletar</span>
-                  </button>
+                  {explorerActiveCategory !== "trash" && (
+                    <button
+                      onClick={handleExplorerDelete}
+                      disabled={explorerBusy}
+                      className="gdrive-btn flex items-center space-x-1 px-3 py-1.5 text-xs font-medium text-[#d93025] bg-[#fce8e6] dark:bg-[#d93025]/20 hover:bg-[#fad2cf] rounded-full transition cursor-pointer disabled:opacity-50"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Deletar</span>
+                    </button>
+                  )}
                 </div>
               )}
             </div>

@@ -6,6 +6,8 @@ use tokio::io::AsyncBufReadExt;
 pub struct CloudEntry {
     #[serde(rename = "Name")]
     pub name: String,
+    #[serde(rename = "Path", default)]
+    pub path: String,
     #[serde(rename = "Size")]
     pub size: i64,
     #[serde(rename = "IsDir")]
@@ -95,6 +97,7 @@ pub async fn list_cloud_files_stream(
         for d in &drives {
             let entry = CloudEntry {
                 name: d.name.clone(),
+                path: d.name.clone(),
                 size: 0,
                 is_dir: true,
                 mod_time: String::new(),
@@ -105,12 +108,77 @@ pub async fn list_cloud_files_stream(
         return Ok(drives.len());
     }
 
-    let mut args: Vec<String> = vec!["lsjson".to_string(), "--max-depth".to_string(), "1".to_string()];
-    match cat.as_str() {
-        "shared_with_me" => args.push("--drive-shared-with-me".to_string()),
-        "trash" => args.push("--drive-trashed-only".to_string()),
-        "starred" => args.push("--drive-starred-only".to_string()),
-        _ => {}
+    if cat == "recent" {
+        // Usa `rclone backend query` para consultar os arquivos recentes reais na nuvem (não apenas da raiz)
+        let target = format!("{}:", remote);
+        let query = "trashed = false and mimeType != 'application/vnd.google-apps.folder'";
+        let out = match run_rclone(&["backend", "query", &target, query]).await {
+            Ok(o) => o,
+            Err(_) => String::new(),
+        };
+
+        #[derive(Deserialize)]
+        struct QueryItem {
+            name: Option<String>,
+            size: Option<serde_json::Value>,
+            #[serde(rename = "modifiedTime")]
+            modified_time: Option<String>,
+        }
+
+        let mut items: Vec<CloudEntry> = Vec::new();
+        if let Some(start_idx) = out.find('[') {
+            if let Ok(raw_items) = serde_json::from_str::<Vec<QueryItem>>(&out[start_idx..]) {
+                for item in raw_items {
+                    let name = item.name.unwrap_or_default();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let size = match item.size {
+                        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
+                        Some(serde_json::Value::String(s)) => s.parse::<i64>().unwrap_or(0),
+                        _ => 0,
+                    };
+                    let mod_time = item.modified_time.unwrap_or_default();
+                    items.push(CloudEntry {
+                        name: name.clone(),
+                        path: name,
+                        size,
+                        is_dir: false,
+                        mod_time,
+                    });
+                }
+            }
+        }
+
+        // Ordena pelos modificados mais recentemente e limita aos 100 mais recentes
+        items.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
+        let total = items.len().min(100);
+        for entry in items.into_iter().take(total) {
+            let _ = app.emit(&entry_event, entry);
+        }
+        let _ = app.emit(&done_event, total);
+        return Ok(total);
+    }
+
+    let mut args: Vec<String> = vec!["lsjson".to_string()];
+    let is_trash = cat == "trash";
+
+    if is_trash {
+        // --drive-trashed-only only actually filters when the listing is
+        // recursive: with --max-depth 1 rclone still returns every top-level
+        // folder as a path container, which looked exactly like the normal
+        // "Meu Drive" listing (and made "Deletar"/"Selecionar tudo" dangerous
+        // here, since they'd operate on real, non-trashed content).
+        args.push("--drive-trashed-only".to_string());
+        args.push("-R".to_string());
+    } else {
+        args.push("--max-depth".to_string());
+        args.push("1".to_string());
+        match cat.as_str() {
+            "shared_with_me" => args.push("--drive-shared-with-me".to_string()),
+            "starred" => args.push("--drive-starred-only".to_string()),
+            _ => {}
+        }
     }
     let target = format!("{}:{}", remote, path.trim_start_matches('/'));
     args.push(target);
@@ -132,6 +200,11 @@ pub async fn list_cloud_files_stream(
             continue;
         }
         if let Ok(entry) = serde_json::from_str::<CloudEntry>(trimmed) {
+            // In the trash view, skip directories: with -R they're just path
+            // scaffolding needed to reach trashed files, not trashed themselves.
+            if is_trash && entry.is_dir {
+                continue;
+            }
             count += 1;
             let _ = app.emit(&entry_event, entry);
         }
