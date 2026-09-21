@@ -192,9 +192,25 @@ pub async fn list_cloud_files_stream(
         } else {
             "trashed = false and mimeType != 'application/vnd.google-apps.folder'"
         };
-        let out = match run_rclone(&["backend", "query", &target, query]).await {
-            Ok(o) => o,
-            Err(e) => return Err(e),
+        // This query can't be served from the local mount (trash/recent aren't
+        // reflected in the FUSE view), so it always competes with the mount's
+        // background polling for the same throttled API. Bound it so a slow
+        // API moment shows a clear error instead of an indefinite spinner.
+        let out = match tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            run_rclone(&["backend", "query", &target, query]),
+        )
+        .await
+        {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(
+                    "A consulta à nuvem demorou demasiado (a API do Google pode estar lenta). \
+                     Tente novamente — se a nuvem estiver montada, desmontá-la temporariamente pode ajudar."
+                        .to_string(),
+                )
+            }
         };
 
         #[derive(Deserialize)]

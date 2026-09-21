@@ -595,6 +595,7 @@ export default function App() {
   const explorerUnlisten = useRef<UnlistenFn[]>([]);
   const explorerBuffer = useRef<CloudEntry[]>([]);
   const explorerFlushScheduled = useRef(false);
+  const explorerCache = useRef<Map<string, CloudEntry[]>>(new Map());
   const [explorerDebugLog, setExplorerDebugLog] = useState<string[]>([]);
 
   const loadExplorer = async (remote: string, path: string, categoryOverride?: string) => {
@@ -606,10 +607,21 @@ export default function App() {
     const requestId = String(++explorerRequestId.current);
     explorerBuffer.current = [];
     setExplorerLoading(true);
-    setExplorerEntries([]);
     setExplorerSelected(new Set());
     setExplorerDebugLog([]);
     const cat = categoryOverride !== undefined ? categoryOverride : explorerActiveCategory;
+
+    // Categories that can't be served from the local mount (recent/trash) hit
+    // the API every time, competing with the mount's own polling. Show the
+    // last known result instantly while a fresh one loads in the background,
+    // instead of blanking the screen on every reopen.
+    const cacheKey = `${remote}|${cat}|${path}`;
+    const cached = explorerCache.current.get(cacheKey);
+    if (cached) {
+      setExplorerEntries(cached);
+    } else {
+      setExplorerEntries([]);
+    }
 
     const t0 = performance.now();
     const log = (msg: string) => {
@@ -643,6 +655,7 @@ export default function App() {
         if (explorerRequestId.current !== Number(requestId)) return;
         log(`done event, total=${event.payload}`);
         flush();
+        explorerCache.current.set(cacheKey, [...explorerBuffer.current]);
         setExplorerLoading(false);
       });
       explorerUnlisten.current = [unEntry, unDone];
