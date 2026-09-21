@@ -1,0 +1,141 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  font-family: "Google Sans", "Segoe UI", Roboto, -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif;
+  user-select: none;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #f8f9fa;
+  color: #202124;
+  overflow-x: hidden;
+  transition: background-color 0.25s ease, color 0.25s ease;
+}
+
+.dark body {
+  background-color: #202124;
+  color: #e8eaed;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.94) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -400px 0;
+  }
+  100% {
+    background-position: 400px 0;
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.2s ease-out;
+}
+
+.animate-scaleIn {
+  animation: scaleIn 0.18s cubic-bezier(0.2, 0, 0.2, 1);
+}
+
+.animate-slideUp {
+  animation: slideUp 0.35s cubic-bezier(0.2, 0, 0.2, 1) both;
+}
+
+.skeleton {
+  background: linear-gradient(90deg, #eceff1 25%, #f5f6f7 37%, #eceff1 63%);
+  background-size: 400px 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+
+.gdrive-card {
+  transition: box-shadow 0.18s ease, transform 0.18s ease, border-color 0.18s ease;
+}
+
+.gdrive-card:hover {
+  box-shadow: 0 1px 2px 0 rgba(60, 64, 67, 0.3), 0 2px 6px 2px rgba(60, 64, 67, 0.15);
+  transform: translateY(-2px);
+}
+
+.gdrive-btn {
+  transition: background-color 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease;
+}
+
+.gdrive-btn:active {
+  transform: scale(0.97);
+}
+
+.ripple-dot {
+  animation: pulseDot 1.6s ease-in-out infinite;
+}
+
+@keyframes pulseDot {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.5;
+    transform: scale(1.3);
+  }
+}
+
+.theme-card {
+  transition: transform 0.22s cubic-bezier(0.2, 0, 0.2, 1), box-shadow 0.22s ease, border-color 0.22s ease;
+}
+
+.theme-card:hover {
+  transform: translateY(-4px) scale(1.03);
+  box-shadow: 0 4px 12px 0 rgba(60, 64, 67, 0.25);
+}
+
+.theme-card:hover .theme-card-preview {
+  transform: scale(1.04);
+}
+
+.theme-card-preview {
+  transition: transform 0.22s cubic-bezier(0.2, 0, 0.2, 1), filter 0.22s ease;
+}
+
+.theme-card:hover .theme-card-dot {
+  transform: translateY(-1px);
+}
+
+.theme-card-dot {
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+.theme-check {
+  transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.2s ease;
+}
