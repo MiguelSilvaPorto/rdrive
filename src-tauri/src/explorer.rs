@@ -1,5 +1,7 @@
+use crate::rclone::AppState;
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
+use std::path::PathBuf;
+use tauri::{Emitter, State};
 use tokio::io::AsyncBufReadExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,10 +89,70 @@ pub async fn list_cloud_files_stream(
     remote: String,
     path: String,
     category: Option<String>,
+    state: State<'_, AppState>,
 ) -> Result<usize, String> {
     let cat = category.unwrap_or_else(|| "mydrive".to_string());
     let entry_event = format!("explorer-entry-{request_id}");
     let done_event = format!("explorer-done-{request_id}");
+
+    // If this remote is already mounted, its VFS cache already knows this
+    // directory's contents locally — read the mount point straight off disk
+    // instead of making another API call. This avoids competing with the
+    // mount's own background polling for the same (often throttled) API
+    // quota, which is what causes browsing to feel slow while mounted.
+    if cat == "mydrive" {
+        let mount_dir = {
+            let mounted = state.mounted_remotes.lock().unwrap();
+            mounted.get(&remote).map(|(dir, _)| dir.clone())
+        };
+
+        if let Some(base) = mount_dir {
+            let target_dir: PathBuf = if path.trim_start_matches('/').is_empty() {
+                base
+            } else {
+                base.join(path.trim_start_matches('/'))
+            };
+
+            match std::fs::read_dir(&target_dir) {
+                Ok(read_dir) => {
+                    let mut count = 0usize;
+                    for entry in read_dir.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        let meta = match entry.metadata() {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        let mod_time = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| {
+                                chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0)
+                                    .map(|dt| dt.to_rfc3339())
+                                    .unwrap_or_default()
+                            })
+                            .unwrap_or_default();
+
+                        let cloud_entry = CloudEntry {
+                            name: name.clone(),
+                            path: name,
+                            size: if meta.is_dir() { 0 } else { meta.len() as i64 },
+                            is_dir: meta.is_dir(),
+                            mod_time,
+                        };
+                        count += 1;
+                        let _ = app.emit(&entry_event, cloud_entry);
+                    }
+                    let _ = app.emit(&done_event, count);
+                    return Ok(count);
+                }
+                Err(_) => {
+                    // Mount point unreadable (e.g. still initializing) — fall
+                    // through to the normal rclone lsjson path below.
+                }
+            }
+        }
+    }
 
     if cat == "shared" {
         let drives = list_shared_drives(remote).await?;
