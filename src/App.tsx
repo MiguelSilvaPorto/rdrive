@@ -61,6 +61,11 @@ import {
   Sparkles,
   ArrowRight,
   ArrowLeft,
+  ArrowUpDown,
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  Pause,
+  PlayCircle,
 } from "lucide-react";
 import "./App.css";
 
@@ -143,6 +148,24 @@ interface CloudEntry {
   ModTime: string;
 }
 
+type TransferStatus = "Running" | "Paused" | "Interrupted" | "Completed" | "Failed";
+
+interface TransferJob {
+  id: string;
+  remote: string;
+  direction: "upload" | "download";
+  source: string;
+  dest: string;
+  status: TransferStatus;
+  progress_pct: number;
+  bytes_done: string;
+  bytes_total: string;
+  speed: string;
+  eta: string;
+  error: string | null;
+  created_at: string;
+}
+
 const formatBytes = (bytes: number) => {
   if (bytes < 0) return "-";
   if (bytes === 0) return "0 B";
@@ -164,6 +187,169 @@ export default function App() {
   const [newRemoteType, setNewRemoteType] = useState("");
   const [authorizing, setAuthorizing] = useState(false);
   const [installingRclone, setInstallingRclone] = useState(false);
+
+  const [showTransfers, setShowTransfers] = useState(false);
+  const [transferJobs, setTransferJobs] = useState<TransferJob[]>([]);
+  const [showNewTransfer, setShowNewTransfer] = useState(false);
+  const [newTransferRemote, setNewTransferRemote] = useState("");
+  const [newTransferDirection, setNewTransferDirection] = useState<"upload" | "download">("upload");
+  const [newTransferSource, setNewTransferSource] = useState("");
+  const [newTransferDest, setNewTransferDest] = useState("");
+  const [startingTransfer, setStartingTransfer] = useState(false);
+
+  const activeTransferCount = transferJobs.filter((j) => j.status === "Running").length;
+
+  const [showTraySpeed, setShowTraySpeed] = useState(() => localStorage.getItem("rdrive-tray-speed") === "1");
+  const sessionBytesTotal = useRef(0);
+  const completedJobIds = useRef<Set<string>>(new Set());
+
+  const parseSizeToBytes = (text: string): number => {
+    const match = text.trim().match(/^([\d.,]+)\s*([A-Za-z]+)/);
+    if (!match) return 0;
+    const value = parseFloat(match[1].replace(",", "."));
+    const unit = match[2].toLowerCase();
+    const multipliers: Record<string, number> = {
+      b: 1,
+      kb: 1e3,
+      kib: 1024,
+      mb: 1e6,
+      mib: 1024 ** 2,
+      gb: 1e9,
+      gib: 1024 ** 3,
+      tb: 1e12,
+      tib: 1024 ** 4,
+    };
+    return value * (multipliers[unit] || 1);
+  };
+
+  useEffect(() => {
+    localStorage.setItem("rdrive-tray-speed", showTraySpeed ? "1" : "0");
+  }, [showTraySpeed]);
+
+  useEffect(() => {
+    for (const job of transferJobs) {
+      if (job.status === "Completed" && !completedJobIds.current.has(job.id)) {
+        completedJobIds.current.add(job.id);
+        sessionBytesTotal.current += parseSizeToBytes(job.bytes_total);
+      }
+    }
+  }, [transferJobs]);
+
+  useEffect(() => {
+    if (!showTraySpeed) {
+      invoke("update_tray_status", { text: "" }).catch(() => {});
+      return;
+    }
+
+    const push = () => {
+      const running = transferJobs.filter((j) => j.status === "Running");
+      const downloadJobs = running.filter((j) => j.direction === "download");
+      const uploadJobs = running.filter((j) => j.direction === "upload");
+      const sumSpeed = (jobs: TransferJob[]) => jobs.reduce((acc, j) => acc + parseSizeToBytes(j.speed), 0);
+      const downSpeed = sumSpeed(downloadJobs);
+      const upSpeed = sumSpeed(uploadJobs);
+      const totalGb = (sessionBytesTotal.current / 1e9).toFixed(2);
+
+      const text =
+        running.length === 0
+          ? `Sem transferências ativas · ${totalGb} GB nesta sessão`
+          : `↓ ${formatBytes(downSpeed)}/s  ↑ ${formatBytes(upSpeed)}/s · ${totalGb} GB nesta sessão`;
+
+      invoke("update_tray_status", { text }).catch(() => {});
+    };
+
+    push();
+    const interval = setInterval(push, 2000);
+    return () => clearInterval(interval);
+  }, [showTraySpeed, transferJobs]);
+
+  const refreshTransfers = async () => {
+    try {
+      const jobs = await invoke<TransferJob[]>("list_transfers");
+      setTransferJobs(jobs);
+    } catch {}
+  };
+
+  useEffect(() => {
+    refreshTransfers();
+    const unlistenPromise = listen<TransferJob>("transfer-update", (event) => {
+      setTransferJobs((prev) => {
+        const idx = prev.findIndex((j) => j.id === event.payload.id);
+        if (idx === -1) return [event.payload, ...prev];
+        const next = [...prev];
+        next[idx] = event.payload;
+        return next;
+      });
+    });
+    return () => {
+      unlistenPromise.then((fn) => fn());
+    };
+  }, []);
+
+  const openNewTransfer = () => {
+    setNewTransferRemote(remotes[0]?.name || "");
+    setNewTransferDirection("upload");
+    setNewTransferSource("");
+    setNewTransferDest("");
+    setShowNewTransfer(true);
+  };
+
+  const handleStartTransfer = async () => {
+    if (!newTransferRemote || !newTransferSource.trim() || !newTransferDest.trim()) return;
+    setStartingTransfer(true);
+    try {
+      const source =
+        newTransferDirection === "upload" ? newTransferSource.trim() : `${newTransferRemote}:${newTransferSource.trim()}`;
+      const dest =
+        newTransferDirection === "upload" ? `${newTransferRemote}:${newTransferDest.trim()}` : newTransferDest.trim();
+      await invoke<string>("start_transfer", {
+        remote: newTransferRemote,
+        direction: newTransferDirection,
+        source,
+        dest,
+        jobId: null,
+      });
+      setShowNewTransfer(false);
+      await refreshTransfers();
+    } catch (err: any) {
+      setMessage({ type: "error", text: String(err) });
+    } finally {
+      setStartingTransfer(false);
+    }
+  };
+
+  const handlePauseTransfer = async (jobId: string) => {
+    try {
+      await invoke<string>("pause_transfer", { jobId });
+      await refreshTransfers();
+    } catch (err: any) {
+      setMessage({ type: "error", text: String(err) });
+    }
+  };
+
+  const handleResumeTransfer = async (job: TransferJob) => {
+    try {
+      await invoke<string>("start_transfer", {
+        remote: job.remote,
+        direction: job.direction,
+        source: job.source,
+        dest: job.dest,
+        jobId: job.id,
+      });
+      await refreshTransfers();
+    } catch (err: any) {
+      setMessage({ type: "error", text: String(err) });
+    }
+  };
+
+  const handleCancelTransfer = async (jobId: string) => {
+    try {
+      await invoke<string>("cancel_transfer", { jobId });
+      setTransferJobs((prev) => prev.filter((j) => j.id !== jobId));
+    } catch (err: any) {
+      setMessage({ type: "error", text: String(err) });
+    }
+  };
 
   const [showSettings, setShowSettings] = useState(false);
   const [onboardingStep, setOnboardingStep] = useState<number | null>(() =>
@@ -1000,10 +1186,34 @@ export default function App() {
                 <span>Nova Nuvem</span>
               </button>
 
-              <div className="px-3 py-2 flex items-center space-x-3 rounded-r-full bg-[#e8f0fe] dark:bg-[#3c4142] text-[#1a73e8] dark:text-[#8ab4f8] text-sm font-medium">
+              <button
+                onClick={() => setShowTransfers(false)}
+                className={`w-full px-3 py-2 flex items-center space-x-3 rounded-r-full text-sm font-medium transition cursor-pointer text-left ${
+                  !showTransfers
+                    ? "bg-[#e8f0fe] dark:bg-[#3c4142] text-[#1a73e8] dark:text-[#8ab4f8]"
+                    : "text-[#3c4043] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/5"
+                }`}
+              >
                 <Cloud className="w-4.5 h-4.5" />
                 <span>Meu Drive</span>
-              </div>
+              </button>
+
+              <button
+                onClick={() => setShowTransfers(true)}
+                className={`w-full mt-1 px-3 py-2 flex items-center space-x-3 rounded-r-full text-sm font-medium transition cursor-pointer text-left ${
+                  showTransfers
+                    ? "bg-[#e8f0fe] dark:bg-[#3c4142] text-[#1a73e8] dark:text-[#8ab4f8]"
+                    : "text-[#3c4043] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/5"
+                }`}
+              >
+                <ArrowUpDown className="w-4.5 h-4.5" />
+                <span className="flex-1">Transferências</span>
+                {activeTransferCount > 0 && (
+                  <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-[#1a73e8] text-white">
+                    {activeTransferCount}
+                  </span>
+                )}
+              </button>
 
               <div className="mt-6 px-3">
                 <p className="text-xs font-semibold text-[#5f6368] dark:text-[#9aa0a6] uppercase tracking-wide mb-2">Status do Sistema</p>
@@ -1468,8 +1678,12 @@ export default function App() {
 
               {explorerLoading && explorerEntries.length === 0 ? (
                 <div className="space-y-3">
+                  <div className="flex items-center space-x-2 text-xs text-[#9aa0a6] mb-1 animate-fadeIn">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Consultando a nuvem...</span>
+                  </div>
                   {[1, 2, 3, 4, 5, 6].map((i) => (
-                    <div key={i} className="skeleton h-12 rounded-xl" />
+                    <div key={i} className="skeleton h-12 rounded-xl" style={{ animationDelay: `${i * 60}ms` }} />
                   ))}
                 </div>
               ) : (() => {
@@ -1791,6 +2005,135 @@ export default function App() {
               })()}
             </div>
           </div>
+          ) : showTransfers ? (
+          <>
+            <div className="flex items-center justify-between mb-5">
+              <div>
+                <h1 className="text-[22px] font-normal text-[#3c4043] dark:text-[#e8eaed]">Transferências</h1>
+                <p className="text-xs text-[#5f6368] dark:text-[#9aa0a6] mt-0.5">
+                  Cópias em segundo plano que retomam de onde pararam se forem interrompidas.
+                </p>
+              </div>
+              <button
+                onClick={openNewTransfer}
+                disabled={remotes.length === 0}
+                className="gdrive-btn flex items-center space-x-2 px-4 py-2 text-sm font-medium text-white bg-[#1a73e8] hover:bg-[#1765cc] rounded-full shadow-sm transition cursor-pointer disabled:opacity-50"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Nova Transferência</span>
+              </button>
+            </div>
+
+            {transferJobs.length === 0 ? (
+              <div className="animate-fadeIn p-16 text-center rounded-2xl border-2 border-dashed border-[#dadce0] dark:border-white/15 flex flex-col items-center justify-center space-y-3">
+                <div className="p-4 bg-[#e8f0fe] dark:bg-[#1a73e8]/20 rounded-full text-[#1a73e8] dark:text-[#8ab4f8]">
+                  <ArrowUpDown className="w-10 h-10" />
+                </div>
+                <h3 className="text-base font-medium text-[#3c4043] dark:text-[#e8eaed]">Nenhuma transferência ainda</h3>
+                <p className="text-sm text-[#5f6368] dark:text-[#9aa0a6] max-w-sm">
+                  Envie ou baixe pastas inteiras em segundo plano. Se a app fechar ou a rede cair a meio, é só clicar em
+                  "Retomar" — nada que já foi copiado é refeito.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {transferJobs.map((job) => {
+                  const statusStyle: Record<TransferStatus, { label: string; color: string; bg: string }> = {
+                    Running: { label: "Em andamento", color: "text-[#1a73e8] dark:text-[#8ab4f8]", bg: "bg-[#e8f0fe] dark:bg-[#1a73e8]/20" },
+                    Paused: { label: "Pausada", color: "text-[#f9ab00]", bg: "bg-[#fef7e0] dark:bg-[#f9ab00]/20" },
+                    Interrupted: { label: "Interrompida", color: "text-[#f9ab00]", bg: "bg-[#fef7e0] dark:bg-[#f9ab00]/20" },
+                    Completed: { label: "Concluída", color: "text-[#188038]", bg: "bg-[#e6f4ea] dark:bg-[#188038]/20" },
+                    Failed: { label: "Falhou", color: "text-[#d93025]", bg: "bg-[#fce8e6] dark:bg-[#d93025]/20" },
+                  };
+                  const s = statusStyle[job.status];
+                  const DirIcon = job.direction === "upload" ? ArrowUpFromLine : ArrowDownToLine;
+
+                  return (
+                    <div
+                      key={job.id}
+                      className="gdrive-card p-4 rounded-2xl border border-[#e8eaed] dark:border-white/10 bg-white dark:bg-[#2d2e30]"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-center space-x-3 min-w-0">
+                          <div className="w-10 h-10 rounded-xl bg-[#f1f3f4] dark:bg-white/10 text-[#5f6368] dark:text-[#e8eaed] flex items-center justify-center shrink-0">
+                            <DirIcon className="w-5 h-5" />
+                          </div>
+                          <div className="min-w-0">
+                            <p className="text-sm font-medium text-[#202124] dark:text-[#e8eaed] truncate">
+                              {job.source} <ArrowRight className="w-3 h-3 inline mx-1 text-[#9aa0a6]" /> {job.dest}
+                            </p>
+                            <p className="text-xs text-[#9aa0a6] mt-0.5">{job.remote}</p>
+                          </div>
+                        </div>
+                        <span className={`shrink-0 text-[11px] font-semibold px-2 py-1 rounded-full ${s.color} ${s.bg}`}>
+                          {s.label}
+                        </span>
+                      </div>
+
+                      <div className="mt-3 h-1.5 rounded-full bg-[#f1f3f4] dark:bg-white/10 overflow-hidden">
+                        <div
+                          className="h-full rounded-full bg-[#1a73e8] dark:bg-[#8ab4f8] transition-all duration-500"
+                          style={{ width: `${Math.min(100, Math.max(0, job.progress_pct))}%` }}
+                        />
+                      </div>
+
+                      <div className="flex items-center justify-between mt-2">
+                        <p className="text-xs text-[#5f6368] dark:text-[#9aa0a6]">
+                          {job.bytes_done} / {job.bytes_total}
+                          {job.status === "Running" && ` · ${job.speed} · ETA ${job.eta}`}
+                        </p>
+
+                        <div className="flex items-center space-x-1.5">
+                          {job.status === "Running" && (
+                            <button
+                              onClick={() => handlePauseTransfer(job.id)}
+                              className="gdrive-btn p-1.5 text-[#5f6368] dark:text-[#9aa0a6] hover:bg-[#f1f3f4] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                              title="Pausar"
+                            >
+                              <Pause className="w-4 h-4" />
+                            </button>
+                          )}
+                          {(job.status === "Paused" || job.status === "Interrupted" || job.status === "Failed") && (
+                            <button
+                              onClick={() => handleResumeTransfer(job)}
+                              className="gdrive-btn p-1.5 text-[#1a73e8] dark:text-[#8ab4f8] hover:bg-[#e8f0fe] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                              title="Retomar"
+                            >
+                              <PlayCircle className="w-4 h-4" />
+                            </button>
+                          )}
+                          {job.status !== "Completed" && (
+                            <button
+                              onClick={() => handleCancelTransfer(job.id)}
+                              className="gdrive-btn p-1.5 text-[#d93025] hover:bg-[#fce8e6] dark:hover:bg-[#d93025]/10 rounded-full transition cursor-pointer"
+                              title="Cancelar e remover"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
+                          {job.status === "Completed" && (
+                            <button
+                              onClick={() => handleCancelTransfer(job.id)}
+                              className="gdrive-btn p-1.5 text-[#9aa0a6] hover:bg-[#f1f3f4] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+                              title="Remover da lista"
+                            >
+                              <X className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {job.error && (
+                        <p className="text-xs text-[#d93025] mt-2 bg-[#fce8e6] dark:bg-[#d93025]/10 rounded-lg px-2.5 py-1.5">
+                          {job.error}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </>
           ) : (
           <>
           {status && (!status.rclone_installed || !status.fuse_installed) && (
@@ -2044,7 +2387,7 @@ export default function App() {
               <h2 className="text-lg font-medium text-[#202124] dark:text-[#e8eaed]">Conectar nova nuvem</h2>
               <button
                 onClick={() => !authorizing && setShowAddModal(false)}
-                className="gdrive-btn p-1.5 text-[#5f6368] hover:bg-[#f1f3f4] rounded-full transition cursor-pointer"
+                className="gdrive-btn p-1.5 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -2061,8 +2404,8 @@ export default function App() {
                       disabled={authorizing}
                       className={`gdrive-btn px-2 py-2.5 rounded-xl text-xs font-medium border transition cursor-pointer text-center ${
                         newRemoteType === p.id
-                          ? "border-[#1a73e8] bg-[#e8f0fe] text-[#1a73e8]"
-                          : "border-[#e8eaed] text-[#3c4043] hover:bg-[#f8f9fa]"
+                          ? "border-[#1a73e8] dark:border-[#8ab4f8] bg-[#e8f0fe] dark:bg-[#1a73e8]/20 text-[#1a73e8] dark:text-[#8ab4f8]"
+                          : "border-[#e8eaed] dark:border-white/10 text-[#3c4043] dark:text-[#e8eaed] hover:bg-[#f8f9fa] dark:hover:bg-white/5"
                       }`}
                     >
                       {p.label}
@@ -2079,19 +2422,19 @@ export default function App() {
                   onChange={(e) => setNewRemoteName(e.target.value)}
                   disabled={authorizing}
                   placeholder="ex: meu-google-drive"
-                  className="w-full px-3.5 py-2.5 text-sm border border-[#dadce0] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40 focus:border-[#1a73e8] transition disabled:opacity-50"
+                  className="w-full px-3.5 py-2.5 text-sm border border-[#dadce0] dark:border-white/15 dark:bg-transparent dark:text-[#e8eaed] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40 focus:border-[#1a73e8] transition disabled:opacity-50"
                 />
               </div>
 
               {authorizing && (
-                <div className="animate-fadeIn flex items-center space-x-3 p-3.5 bg-[#e8f0fe] rounded-xl text-[#1a73e8] text-xs">
+                <div className="animate-fadeIn flex items-center space-x-3 p-3.5 bg-[#e8f0fe] dark:bg-[#1a73e8]/20 rounded-xl text-[#1a73e8] dark:text-[#8ab4f8] text-xs">
                   <Loader2 className="w-5 h-5 animate-spin shrink-0" />
                   <div>
                     <p className="font-medium flex items-center space-x-1.5">
                       <ShieldCheck className="w-3.5 h-3.5" />
                       <span>Aguardando autorização...</span>
                     </p>
-                    <p className="text-[#1a73e8]/80 mt-0.5">
+                    <p className="text-[#1a73e8]/80 dark:text-[#8ab4f8]/80 mt-0.5">
                       Uma janela do navegador foi aberta. Conclua o login e a permissão de acesso.
                     </p>
                   </div>
@@ -2103,7 +2446,7 @@ export default function App() {
               <button
                 onClick={() => setShowAddModal(false)}
                 disabled={authorizing}
-                className="gdrive-btn px-4 py-2 text-sm font-medium text-[#3c4043] hover:bg-[#f1f3f4] rounded-full transition cursor-pointer disabled:opacity-50"
+                className="gdrive-btn px-4 py-2 text-sm font-medium text-[#3c4043] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 rounded-full transition cursor-pointer disabled:opacity-50"
               >
                 Cancelar
               </button>
@@ -2114,6 +2457,121 @@ export default function App() {
               >
                 {authorizing && <Loader2 className="w-4 h-4 animate-spin" />}
                 <span>{authorizing ? "Autorizando" : "Autorizar no navegador"}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* New Transfer Modal */}
+      {showNewTransfer && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center">
+          <div
+            className="absolute inset-0 bg-black/40 animate-fadeIn"
+            onClick={() => !startingTransfer && setShowNewTransfer(false)}
+          />
+          <div className="relative animate-scaleIn bg-white dark:bg-[#2d2e30] rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+            <div className="flex items-center justify-between px-6 pt-5 pb-4 border-b border-[#e8eaed] dark:border-white/10">
+              <h2 className="text-lg font-medium text-[#202124] dark:text-[#e8eaed]">Nova transferência</h2>
+              <button
+                onClick={() => !startingTransfer && setShowNewTransfer(false)}
+                className="gdrive-btn p-1.5 text-[#5f6368] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 rounded-full transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="px-6 py-5 space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-[#5f6368] dark:text-[#9aa0a6] mb-1.5">Nuvem</label>
+                <select
+                  value={newTransferRemote}
+                  onChange={(e) => setNewTransferRemote(e.target.value)}
+                  disabled={startingTransfer}
+                  className="w-full px-3.5 py-2.5 text-sm border border-[#dadce0] dark:border-white/15 dark:bg-[#202124] dark:text-[#e8eaed] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40 focus:border-[#1a73e8] transition"
+                >
+                  {remotes.map((r) => (
+                    <option key={r.name} value={r.name}>
+                      {r.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-[#5f6368] dark:text-[#9aa0a6] mb-1.5">Direção</label>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => setNewTransferDirection("upload")}
+                    disabled={startingTransfer}
+                    className={`gdrive-btn flex items-center justify-center space-x-1.5 px-3 py-2.5 rounded-xl text-xs font-medium border transition cursor-pointer ${
+                      newTransferDirection === "upload"
+                        ? "border-[#1a73e8] dark:border-[#8ab4f8] bg-[#e8f0fe] dark:bg-[#1a73e8]/20 text-[#1a73e8] dark:text-[#8ab4f8]"
+                        : "border-[#e8eaed] dark:border-white/10 text-[#3c4043] dark:text-[#e8eaed] hover:bg-[#f8f9fa] dark:hover:bg-white/5"
+                    }`}
+                  >
+                    <ArrowUpFromLine className="w-3.5 h-3.5" />
+                    <span>Enviar (local → nuvem)</span>
+                  </button>
+                  <button
+                    onClick={() => setNewTransferDirection("download")}
+                    disabled={startingTransfer}
+                    className={`gdrive-btn flex items-center justify-center space-x-1.5 px-3 py-2.5 rounded-xl text-xs font-medium border transition cursor-pointer ${
+                      newTransferDirection === "download"
+                        ? "border-[#1a73e8] dark:border-[#8ab4f8] bg-[#e8f0fe] dark:bg-[#1a73e8]/20 text-[#1a73e8] dark:text-[#8ab4f8]"
+                        : "border-[#e8eaed] dark:border-white/10 text-[#3c4043] dark:text-[#e8eaed] hover:bg-[#f8f9fa] dark:hover:bg-white/5"
+                    }`}
+                  >
+                    <ArrowDownToLine className="w-3.5 h-3.5" />
+                    <span>Baixar (nuvem → local)</span>
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-[#5f6368] dark:text-[#9aa0a6] mb-1.5">
+                  {newTransferDirection === "upload" ? "Pasta local de origem" : "Pasta na nuvem de origem"}
+                </label>
+                <input
+                  type="text"
+                  value={newTransferSource}
+                  onChange={(e) => setNewTransferSource(e.target.value)}
+                  disabled={startingTransfer}
+                  placeholder={newTransferDirection === "upload" ? "/home/usuario/Documentos" : "Fotos/2026"}
+                  className="w-full px-3.5 py-2.5 text-sm border border-[#dadce0] dark:border-white/15 dark:bg-transparent dark:text-[#e8eaed] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40 focus:border-[#1a73e8] transition"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-[#5f6368] dark:text-[#9aa0a6] mb-1.5">
+                  {newTransferDirection === "upload" ? "Pasta na nuvem de destino" : "Pasta local de destino"}
+                </label>
+                <input
+                  type="text"
+                  value={newTransferDest}
+                  onChange={(e) => setNewTransferDest(e.target.value)}
+                  disabled={startingTransfer}
+                  placeholder={newTransferDirection === "upload" ? "Backups/2026" : "/home/usuario/Downloads"}
+                  className="w-full px-3.5 py-2.5 text-sm border border-[#dadce0] dark:border-white/15 dark:bg-transparent dark:text-[#e8eaed] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1a73e8]/40 focus:border-[#1a73e8] transition"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end space-x-2 px-6 py-4 bg-[#f8f9fa] dark:bg-[#202124]">
+              <button
+                onClick={() => setShowNewTransfer(false)}
+                disabled={startingTransfer}
+                className="gdrive-btn px-4 py-2 text-sm font-medium text-[#3c4043] dark:text-[#e8eaed] hover:bg-[#f1f3f4] dark:hover:bg-white/10 rounded-full transition cursor-pointer disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={handleStartTransfer}
+                disabled={startingTransfer || !newTransferRemote || !newTransferSource.trim() || !newTransferDest.trim()}
+                className="gdrive-btn flex items-center space-x-2 px-5 py-2 text-sm font-medium text-white bg-[#1a73e8] hover:bg-[#1765cc] rounded-full shadow-sm transition cursor-pointer disabled:opacity-50"
+              >
+                {startingTransfer && <Loader2 className="w-4 h-4 animate-spin" />}
+                <span>{startingTransfer ? "Iniciando..." : "Iniciar transferência"}</span>
               </button>
             </div>
           </div>
@@ -2225,7 +2683,7 @@ export default function App() {
                   type="checkbox"
                   checked={mountSettingsDraft.readOnly}
                   onChange={(e) => setMountSettingsDraft((s) => ({ ...s, readOnly: e.target.checked }))}
-                  className="w-4 h-4 accent-[#1a73e8] cursor-pointer"
+                  className="rdrive-checkbox w-4 h-4 cursor-pointer"
                 />
               </label>
 
@@ -2242,7 +2700,7 @@ export default function App() {
                   type="checkbox"
                   checked={mountSettingsDraft.autoRemount}
                   onChange={(e) => setMountSettingsDraft((s) => ({ ...s, autoRemount: e.target.checked }))}
-                  className="w-4 h-4 mt-3.5 accent-[#1a73e8] cursor-pointer shrink-0"
+                  className="rdrive-checkbox w-4 h-4 mt-3.5 cursor-pointer shrink-0"
                 />
               </label>
             </div>
@@ -2339,7 +2797,7 @@ export default function App() {
                     checked={autostartOn}
                     disabled={autostartBusy}
                     onChange={toggleAutostart}
-                    className="w-4 h-4 accent-[#1a73e8] cursor-pointer shrink-0 ml-3"
+                    className="rdrive-checkbox w-4 h-4 cursor-pointer shrink-0 ml-3"
                   />
                 </label>
 
@@ -2354,6 +2812,22 @@ export default function App() {
                     Shift+Alt+D
                   </kbd>
                 </div>
+
+                <label className="flex items-center justify-between pt-2 border-t border-[#e8eaed] dark:border-white/10 cursor-pointer">
+                  <span>
+                    <span className="block text-sm text-[#3c4043] dark:text-[#e8eaed]">Velocidade na bandeja</span>
+                    <span className="block text-[11px] text-[#9aa0a6] mt-0.5">
+                      Mostra download/upload e total transferido ao passar o rato no ícone da bandeja (não existe
+                      espaço para isso na barra do sistema em si — apenas apps do próprio painel conseguem escrever lá).
+                    </span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={showTraySpeed}
+                    onChange={(e) => setShowTraySpeed(e.target.checked)}
+                    className="rdrive-checkbox w-4 h-4 cursor-pointer shrink-0 ml-3"
+                  />
+                </label>
               </div>
             </div>
 

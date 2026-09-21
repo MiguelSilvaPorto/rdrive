@@ -108,19 +108,30 @@ pub async fn list_cloud_files_stream(
         return Ok(drives.len());
     }
 
-    if cat == "recent" {
-        // Usa `rclone backend query` para consultar os arquivos recentes reais na nuvem (não apenas da raiz)
+    if cat == "recent" || cat == "trash" {
+        // lsjson's --max-depth 1 can't be combined with --drive-trashed-only
+        // (it silently falls back to a normal, unfiltered folder listing), and
+        // there's no reliable way to tell a genuinely trashed folder apart from
+        // a path-scaffolding one in that output. Querying the Drive API
+        // directly for `trashed = true`/`false` gives the real, unambiguous
+        // set of items instead.
         let target = format!("{}:", remote);
-        let query = "trashed = false and mimeType != 'application/vnd.google-apps.folder'";
+        let query = if cat == "trash" {
+            "trashed = true"
+        } else {
+            "trashed = false and mimeType != 'application/vnd.google-apps.folder'"
+        };
         let out = match run_rclone(&["backend", "query", &target, query]).await {
             Ok(o) => o,
-            Err(_) => String::new(),
+            Err(e) => return Err(e),
         };
 
         #[derive(Deserialize)]
         struct QueryItem {
             name: Option<String>,
             size: Option<serde_json::Value>,
+            #[serde(rename = "mimeType")]
+            mime_type: Option<String>,
             #[serde(rename = "modifiedTime")]
             modified_time: Option<String>,
         }
@@ -138,21 +149,22 @@ pub async fn list_cloud_files_stream(
                         Some(serde_json::Value::String(s)) => s.parse::<i64>().unwrap_or(0),
                         _ => 0,
                     };
+                    let is_dir = item.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
                     let mod_time = item.modified_time.unwrap_or_default();
                     items.push(CloudEntry {
                         name: name.clone(),
                         path: name,
                         size,
-                        is_dir: false,
+                        is_dir,
                         mod_time,
                     });
                 }
             }
         }
 
-        // Ordena pelos modificados mais recentemente e limita aos 100 mais recentes
+        // Ordena pelos modificados mais recentemente e limita a 300 itens
         items.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
-        let total = items.len().min(100);
+        let total = items.len().min(300);
         for entry in items.into_iter().take(total) {
             let _ = app.emit(&entry_event, entry);
         }
@@ -160,25 +172,11 @@ pub async fn list_cloud_files_stream(
         return Ok(total);
     }
 
-    let mut args: Vec<String> = vec!["lsjson".to_string()];
-    let is_trash = cat == "trash";
-
-    if is_trash {
-        // --drive-trashed-only only actually filters when the listing is
-        // recursive: with --max-depth 1 rclone still returns every top-level
-        // folder as a path container, which looked exactly like the normal
-        // "Meu Drive" listing (and made "Deletar"/"Selecionar tudo" dangerous
-        // here, since they'd operate on real, non-trashed content).
-        args.push("--drive-trashed-only".to_string());
-        args.push("-R".to_string());
-    } else {
-        args.push("--max-depth".to_string());
-        args.push("1".to_string());
-        match cat.as_str() {
-            "shared_with_me" => args.push("--drive-shared-with-me".to_string()),
-            "starred" => args.push("--drive-starred-only".to_string()),
-            _ => {}
-        }
+    let mut args: Vec<String> = vec!["lsjson".to_string(), "--max-depth".to_string(), "1".to_string()];
+    match cat.as_str() {
+        "shared_with_me" => args.push("--drive-shared-with-me".to_string()),
+        "starred" => args.push("--drive-starred-only".to_string()),
+        _ => {}
     }
     let target = format!("{}:{}", remote, path.trim_start_matches('/'));
     args.push(target);
@@ -200,11 +198,6 @@ pub async fn list_cloud_files_stream(
             continue;
         }
         if let Ok(entry) = serde_json::from_str::<CloudEntry>(trimmed) {
-            // In the trash view, skip directories: with -R they're just path
-            // scaffolding needed to reach trashed files, not trashed themselves.
-            if is_trash && entry.is_dir {
-                continue;
-            }
             count += 1;
             let _ = app.emit(&entry_event, entry);
         }

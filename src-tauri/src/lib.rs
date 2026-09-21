@@ -21,6 +21,21 @@ use transfers::{
     TransferState,
 };
 
+/// Updates the tray icon's hover tooltip with live transfer speed/total.
+/// This is the closest a regular Linux app can get to a "status bar" —
+/// desktop panels don't let ordinary applications draw text into them,
+/// that's reserved for panel widgets/applets, so the tooltip is the
+/// honest, achievable equivalent.
+#[tauri::command]
+fn update_tray_status(tray: tauri::State<'_, tauri::tray::TrayIcon>, text: String) -> Result<(), String> {
+    let tooltip = if text.trim().is_empty() {
+        "Rdrive".to_string()
+    } else {
+        format!("Rdrive\n{text}")
+    };
+    tray.set_tooltip(Some(&tooltip)).map_err(|e| e.to_string())
+}
+
 fn toggle_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         if window.is_visible().unwrap_or(false) {
@@ -77,6 +92,7 @@ pub fn run() {
             empty_cloud_trash,
             list_shared_drives,
             untrash_cloud_paths,
+            update_tray_status,
         ])
         .setup(|app| {
             let toggle_shortcut = Shortcut::new(Some(Modifiers::SHIFT | Modifiers::ALT), Code::KeyD);
@@ -88,8 +104,9 @@ pub fn run() {
             let quit_item = MenuItem::with_id(app, "quit", "Sair", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
-            TrayIconBuilder::new()
+            let tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("Rdrive")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -121,6 +138,8 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            app.manage(tray);
 
             Ok(())
         })
