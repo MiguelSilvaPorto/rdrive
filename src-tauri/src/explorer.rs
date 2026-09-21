@@ -27,15 +27,53 @@ async fn run_rclone(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Lists the contents of a cloud folder (non-recursive)
+/// Lists the contents of a cloud folder (non-recursive) or specific category
 #[tauri::command]
-pub async fn list_cloud_files(remote: String, path: String) -> Result<Vec<CloudEntry>, String> {
+pub async fn list_cloud_files(
+    remote: String,
+    path: String,
+    category: Option<String>,
+) -> Result<Vec<CloudEntry>, String> {
+    let cat = category.unwrap_or_else(|| "mydrive".to_string());
+    let mut args: Vec<String> = vec!["lsjson".to_string()];
+
+    match cat.as_str() {
+        "shared_with_me" => {
+            args.push("--drive-shared-with-me".to_string());
+        }
+        "trash" => {
+            args.push("--drive-trashed-only".to_string());
+        }
+        "starred" => {
+            args.push("--drive-starred-only".to_string());
+        }
+        _ => {}
+    }
+
     let target = format!("{}:{}", remote, path.trim_start_matches('/'));
-    let out = run_rclone(&["lsjson", &target]).await?;
+    args.push(target);
+
+    let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = run_rclone(&str_args).await?;
     let mut entries: Vec<CloudEntry> =
         serde_json::from_str(&out).map_err(|e| format!("Falha ao interpretar listagem: {e}"))?;
-    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+
+    if cat == "recent" {
+        // Ordena por data mais recente
+        entries.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
+    } else {
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    }
+
     Ok(entries)
+}
+
+/// Empties trash for cloud remotes supporting cleanup (e.g. Google Drive)
+#[tauri::command]
+pub async fn empty_cloud_trash(remote: String) -> Result<String, String> {
+    let target = format!("{}:", remote);
+    run_rclone(&["cleanup", &target]).await?;
+    Ok("Lixeira esvaziada com sucesso.".to_string())
 }
 
 /// Deletes one or more files/folders (folders are removed recursively)

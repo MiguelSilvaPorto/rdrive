@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { isEnabled as isAutostartEnabled, enable as enableAutostart, disable as disableAutostart } from "@tauri-apps/plugin-autostart";
 import {
   Cloud,
   HardDrive,
@@ -159,6 +160,29 @@ export default function App() {
   const [installingRclone, setInstallingRclone] = useState(false);
 
   const [showSettings, setShowSettings] = useState(false);
+  const [autostartOn, setAutostartOn] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+
+  useEffect(() => {
+    isAutostartEnabled().then(setAutostartOn).catch(() => {});
+  }, []);
+
+  const toggleAutostart = async () => {
+    setAutostartBusy(true);
+    try {
+      if (autostartOn) {
+        await disableAutostart();
+        setAutostartOn(false);
+      } else {
+        await enableAutostart();
+        setAutostartOn(true);
+      }
+    } catch (err: any) {
+      setMessage({ type: "error", text: `Falha ao alterar início automático: ${err}` });
+    } finally {
+      setAutostartBusy(false);
+    }
+  };
   const [mountSettingsFor, setMountSettingsFor] = useState<string | null>(null);
   const [mountSettingsDraft, setMountSettingsDraft] = useState<MountSettings>(DEFAULT_MOUNT_SETTINGS);
 
@@ -368,11 +392,16 @@ export default function App() {
   const explorerJoin = (base: string, name: string) => (base ? `${base}/${name}` : name);
   const explorerBreadcrumbs = () => (explorerPath ? explorerPath.split("/").filter(Boolean) : []);
 
-  const loadExplorer = async (remote: string, path: string) => {
+  const loadExplorer = async (remote: string, path: string, categoryOverride?: string) => {
     setExplorerLoading(true);
     setExplorerSelected(new Set());
+    const cat = categoryOverride !== undefined ? categoryOverride : explorerActiveCategory;
     try {
-      const entries = await invoke<CloudEntry[]>("list_cloud_files", { remote, path });
+      const entries = await invoke<CloudEntry[]>("list_cloud_files", {
+        remote,
+        path,
+        category: cat,
+      });
       setExplorerEntries(entries);
     } catch (err: any) {
       setMessage({ type: "error", text: String(err) });
@@ -388,12 +417,35 @@ export default function App() {
     setExplorerActiveCategory("mydrive");
     setExplorerTransferMode(null);
     setExplorerNewFolder(null);
-    loadExplorer(remote, "");
+    loadExplorer(remote, "", "mydrive");
 
     // Busca cota / armazenamento do drive em segundo plano
     invoke<{ total: number | null; used: number | null; free: number | null }>("get_remote_about", { remote })
       .then((res) => setExplorerQuota(res))
       .catch(() => setExplorerQuota(null));
+  };
+
+  const handleSelectCategory = (cat: string) => {
+    setExplorerActiveCategory(cat);
+    setExplorerPath("");
+    if (explorerFor) {
+      loadExplorer(explorerFor, "", cat);
+    }
+  };
+
+  const handleEmptyTrash = async () => {
+    if (!explorerFor) return;
+    if (!confirm("Esvaziar permanentemente todos os itens da lixeira da nuvem? Esta ação não pode ser desfeita.")) return;
+    setExplorerBusy(true);
+    try {
+      const res = await invoke<string>("empty_cloud_trash", { remote: explorerFor });
+      setMessage({ type: "success", text: res });
+      await loadExplorer(explorerFor, "", "trash");
+    } catch (err: any) {
+      setMessage({ type: "error", text: String(err) });
+    } finally {
+      setExplorerBusy(false);
+    }
   };
 
   const explorerNavigate = (path: string) => {
@@ -717,10 +769,7 @@ export default function App() {
                 {/* Itens de Navegação estilo Google Drive */}
                 <div className="space-y-0.5 text-xs font-medium">
                   <button
-                    onClick={() => {
-                      setExplorerActiveCategory("mydrive");
-                      explorerNavigate("");
-                    }}
+                    onClick={() => handleSelectCategory("mydrive")}
                     className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-full transition cursor-pointer text-left ${
                       explorerActiveCategory === "mydrive"
                         ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
@@ -732,7 +781,7 @@ export default function App() {
                   </button>
 
                   <button
-                    onClick={() => setExplorerActiveCategory("shared")}
+                    onClick={() => handleSelectCategory("shared")}
                     className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-full transition cursor-pointer text-left ${
                       explorerActiveCategory === "shared"
                         ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
@@ -744,7 +793,7 @@ export default function App() {
                   </button>
 
                   <button
-                    onClick={() => setExplorerActiveCategory("computers")}
+                    onClick={() => handleSelectCategory("computers")}
                     className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-full transition cursor-pointer text-left ${
                       explorerActiveCategory === "computers"
                         ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
@@ -760,7 +809,7 @@ export default function App() {
                   </div>
 
                   <button
-                    onClick={() => setExplorerActiveCategory("shared_with_me")}
+                    onClick={() => handleSelectCategory("shared_with_me")}
                     className={`w-full flex items-center space-x-3 px-3.5 py-2 rounded-full transition cursor-pointer text-left ${
                       explorerActiveCategory === "shared_with_me"
                         ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
@@ -772,7 +821,7 @@ export default function App() {
                   </button>
 
                   <button
-                    onClick={() => setExplorerActiveCategory("recent")}
+                    onClick={() => handleSelectCategory("recent")}
                     className={`w-full flex items-center space-x-3 px-3.5 py-2 rounded-full transition cursor-pointer text-left ${
                       explorerActiveCategory === "recent"
                         ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
@@ -784,7 +833,7 @@ export default function App() {
                   </button>
 
                   <button
-                    onClick={() => setExplorerActiveCategory("starred")}
+                    onClick={() => handleSelectCategory("starred")}
                     className={`w-full flex items-center space-x-3 px-3.5 py-2 rounded-full transition cursor-pointer text-left ${
                       explorerActiveCategory === "starred"
                         ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
@@ -796,7 +845,7 @@ export default function App() {
                   </button>
 
                   <button
-                    onClick={() => setExplorerActiveCategory("spam")}
+                    onClick={() => handleSelectCategory("spam")}
                     className={`w-full flex items-center space-x-3 px-3.5 py-2 rounded-full transition cursor-pointer text-left ${
                       explorerActiveCategory === "spam"
                         ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
@@ -808,7 +857,7 @@ export default function App() {
                   </button>
 
                   <button
-                    onClick={() => setExplorerActiveCategory("trash")}
+                    onClick={() => handleSelectCategory("trash")}
                     className={`w-full flex items-center space-x-3 px-3.5 py-2 rounded-full transition cursor-pointer text-left ${
                       explorerActiveCategory === "trash"
                         ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
@@ -820,7 +869,7 @@ export default function App() {
                   </button>
 
                   <button
-                    onClick={() => setExplorerActiveCategory("storage")}
+                    onClick={() => handleSelectCategory("storage")}
                     className={`w-full flex items-center space-x-3 px-3.5 py-2 rounded-full transition cursor-pointer text-left ${
                       explorerActiveCategory === "storage"
                         ? "bg-[#c2e7ff] dark:bg-[#004a77] text-[#001d35] dark:text-[#c2e7ff] font-semibold"
@@ -1048,6 +1097,16 @@ export default function App() {
                   </button>
                 )}
               </div>
+
+              {explorerActiveCategory === "trash" && (
+                <button
+                  onClick={handleEmptyTrash}
+                  className="gdrive-btn flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium text-[#d93025] bg-[#fce8e6] hover:bg-[#fad2cf] border border-[#fad2cf] dark:border-[#d93025]/30 rounded-full transition cursor-pointer"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Esvaziar lixeira</span>
+                </button>
+              )}
 
               {/* Botões de Ação Básica */}
               <button
@@ -1986,6 +2045,41 @@ export default function App() {
                     </button>
                   );
                 })}
+              </div>
+            </div>
+
+            <div className="px-6 pb-5">
+              <p className="text-xs font-semibold text-[#5f6368] dark:text-[#9aa0a6] uppercase tracking-wide mb-3">
+                Sistema
+              </p>
+              <div className="space-y-3">
+                <label className="flex items-center justify-between cursor-pointer">
+                  <span>
+                    <span className="block text-sm text-[#3c4043] dark:text-[#e8eaed]">Iniciar com o sistema</span>
+                    <span className="block text-[11px] text-[#9aa0a6] mt-0.5">
+                      Abre o Rdrive automaticamente ao ligar o computador (minimizado no tray).
+                    </span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={autostartOn}
+                    disabled={autostartBusy}
+                    onChange={toggleAutostart}
+                    className="w-4 h-4 accent-[#1a73e8] cursor-pointer shrink-0 ml-3"
+                  />
+                </label>
+
+                <div className="flex items-center justify-between pt-2 border-t border-[#e8eaed] dark:border-white/10">
+                  <span>
+                    <span className="block text-sm text-[#3c4043] dark:text-[#e8eaed]">Atalho global</span>
+                    <span className="block text-[11px] text-[#9aa0a6] mt-0.5">
+                      Mostra/oculta o Rdrive a qualquer momento, mesmo em segundo plano.
+                    </span>
+                  </span>
+                  <kbd className="px-2 py-1 text-[11px] font-mono font-semibold text-[#3c4043] dark:text-[#e8eaed] bg-[#f1f3f4] dark:bg-white/10 rounded-md border border-[#dadce0] dark:border-white/15">
+                    Shift+Alt+D
+                  </kbd>
+                </div>
               </div>
             </div>
 

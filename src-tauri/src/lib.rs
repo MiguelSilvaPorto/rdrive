@@ -4,7 +4,7 @@ mod transfers;
 
 use explorer::{
     create_cloud_folder, create_share_link, delete_cloud_paths, download_cloud_file,
-    list_cloud_files, preview_cloud_file, transfer_cloud_path,
+    empty_cloud_trash, list_cloud_files, preview_cloud_file, transfer_cloud_path,
 };
 use rclone::{
     check_system_environment, create_remote_oauth, delete_remote, get_remote_about,
@@ -13,16 +13,39 @@ use rclone::{
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, WindowEvent};
+use tauri_plugin_autostart::MacosLauncher;
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use transfers::{
     cancel_transfer, list_transfers, load_persisted_jobs, pause_transfer, start_transfer,
     TransferState,
 };
+
+fn toggle_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+        } else {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        toggle_main_window(app);
+                    }
+                })
+                .build(),
+        )
         .manage(AppState::default())
         .manage(TransferState {
             jobs: std::sync::Mutex::new(load_persisted_jobs()),
@@ -49,8 +72,14 @@ pub fn run() {
             create_share_link,
             download_cloud_file,
             preview_cloud_file,
+            empty_cloud_trash,
         ])
         .setup(|app| {
+            let toggle_shortcut = Shortcut::new(Some(Modifiers::SHIFT | Modifiers::ALT), Code::KeyD);
+            if let Err(e) = app.global_shortcut().register(toggle_shortcut) {
+                eprintln!("[Rdrive] Falha ao registrar atalho global Shift+Alt+D: {e}");
+            }
+
             let show_item = MenuItem::with_id(app, "show", "Mostrar Rdrive", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Sair", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
@@ -84,15 +113,7 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
+                        toggle_main_window(tray.app_handle());
                     }
                 })
                 .build(app)?;
